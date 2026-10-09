@@ -62,6 +62,8 @@ export async function runScript({ source, candles, interval, symbol = 'COIN', in
     overlay: Boolean(declared.overlay),
     inputs: inputsMeta,
     bars: candles.length,
+    /** Open time of the first bar and close time of the last, so a backtest can use the same window. */
+    range: { from: candles[0].openTime, to: candles.at(-1).closeTime ?? candles.at(-1).openTime },
     plots,
     alerts,
     strategy,
