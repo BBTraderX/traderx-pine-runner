@@ -21,7 +21,7 @@ The response has:
 - `plots`: each plot's series by title
 - `alerts`: `alert()` and `alertcondition()` events on every bar
 - `strategy`: for `strategy()` scripts, the trade list and net profit from the PineTS broker emulator
-- `signals`: the strategy's position changes as `EntryLong`, `ExitLong`, `EntryShort` and `ExitShort`, by bar
+- `signals`: the strategy's position changes as `entry-long`, `exit-long`, `entry-short` and `exit-short` (TraderX's signal names), each with its decision bar and that bar's open time
 
 Errors in the script come back as `422` with a readable `error`.
 

@@ -13,7 +13,7 @@ export const TIMEFRAMES = {
   '1d': 'D', '3d': '3D', '1w': 'W', '1M': 'M',
 };
 
-export const SIGNAL_TYPES = ['EntryLong', 'ExitLong', 'EntryShort', 'ExitShort'];
+export const SIGNAL_TYPES = ['entry-long', 'exit-long', 'entry-short', 'exit-short'];
 
 /** Plot keys PineTS uses for drawing objects, not series. */
 const DRAWING_KEYS = new Set(['__labels__', '__lines__', '__boxes__', '__linefills__', '__polylines__', '__tables__']);
@@ -112,10 +112,10 @@ export function tradesToSignals(trades) {
     out.push({ type, bar, time, price });
   };
   for (const t of trades) {
-    add(t.side === 'long' ? 'EntryLong' : 'EntryShort', t.entryBar, t.entryDecisionTime ?? t.entryTime, t.entryPrice);
-    if (t.exitBar != null) add(t.side === 'long' ? 'ExitLong' : 'ExitShort', t.exitBar, t.exitDecisionTime ?? t.exitTime, t.exitPrice);
+    add(t.side === 'long' ? 'entry-long' : 'entry-short', t.entryBar, t.entryDecisionTime ?? t.entryTime, t.entryPrice);
+    if (t.exitBar != null) add(t.side === 'long' ? 'exit-long' : 'exit-short', t.exitBar, t.exitDecisionTime ?? t.exitTime, t.exitPrice);
   }
-  const order = { ExitLong: 0, ExitShort: 0, EntryLong: 1, EntryShort: 1 };
+  const order = { 'exit-long': 0, 'exit-short': 0, 'entry-long': 1, 'entry-short': 1 };
   return out.sort((a, b) => a.bar - b.bar || order[a.type] - order[b.type]);
 }
 

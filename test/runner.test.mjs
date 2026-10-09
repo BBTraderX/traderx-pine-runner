@@ -37,7 +37,7 @@ test('a strategy script returns its inputs, plots, trades and the four signals',
   assert.ok(out.strategy.trades.length > 5);
   // Always-in-market reversals: every exit is followed on the same bar by the opposite entry.
   const types = new Set(out.signals.map((s) => s.type));
-  for (const t of ['EntryLong', 'ExitLong', 'EntryShort', 'ExitShort']) assert.ok(types.has(t), `missing ${t}`);
+  for (const t of ['entry-long', 'exit-long', 'entry-short', 'exit-short']) assert.ok(types.has(t), `missing ${t}`);
   for (let i = 1; i < out.signals.length; i++) assert.ok(out.signals[i].bar >= out.signals[i - 1].bar);
 });
 
@@ -67,7 +67,7 @@ test('a reversal on one bar exits before it enters', () => {
     { side: 'long', entryBar: 1, entryTime: 1, entryPrice: 1, exitBar: 5, exitTime: 5, exitPrice: 2 },
     { side: 'short', entryBar: 5, entryTime: 5, entryPrice: 2, exitBar: null },
   ]);
-  assert.deepEqual(signals.map((s) => `${s.type}@${s.bar}`), ['EntryLong@1', 'ExitLong@5', 'EntryShort@5']);
+  assert.deepEqual(signals.map((s) => `${s.type}@${s.bar}`), ['entry-long@1', 'exit-long@5', 'entry-short@5']);
 });
 
 test('a script that never ends is stopped', async () => {
@@ -112,7 +112,7 @@ if ta.crossunder(f, s)
 `;
     const out = await runScript({ source: src, candles, interval: '1h' });
     const crossBar = out.plots.cu.findIndex((p) => p.value === 1);
-    const entry = out.signals.find((s) => s.type === 'EntryLong');
+    const entry = out.signals.find((s) => s.type === 'entry-long');
     assert.equal(entry.bar, crossBar, `process_orders_on_close=${onClose}`);
   }
 });
