@@ -53,8 +53,13 @@ export async function runScript({ source, candles, interval, symbol = 'COIN', in
 
   const strategy = ctx.strategy ? summarizeStrategy(ctx.strategy, candles) : null;
 
+  // Whether the script draws on the price pane (overlay=true) or its own pane, and its title.
+  const declared = ctx.indicator ?? ctx.strategy?.config ?? {};
+
   return {
     declaration,
+    title: declared.title ?? null,
+    overlay: Boolean(declared.overlay),
     inputs: inputsMeta,
     bars: candles.length,
     plots,

@@ -32,6 +32,8 @@ test('a strategy script returns its inputs, plots, trades and the four signals',
   const out = await runScript({ source: EMA_STRATEGY, candles: zigzag(), interval: '1h' });
 
   assert.equal(out.declaration, 'strategy');
+  assert.equal(out.title, 'EMA Cross');
+  assert.equal(out.overlay, true);
   assert.deepEqual(out.inputs.map((i) => i.title), ['Fast', 'Slow']);
   assert.equal(out.plots['Fast EMA'].length, 400);
   assert.ok(out.strategy.trades.length > 5);

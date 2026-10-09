@@ -16,7 +16,7 @@ Instead of `coin`, send `candles` (oldest first, `{ openTime, open, high, low, c
 
 The response has:
 
-- `declaration`: `"strategy"` or `"indicator"`
+- `declaration`: `"strategy"` or `"indicator"`, plus its `title` and whether it draws on the price pane (`overlay`)
 - `inputs`: every `input.*` in the script, with defaults and limits
 - `plots`: each plot's series by title
 - `alerts`: `alert()` and `alertcondition()` events on every bar
