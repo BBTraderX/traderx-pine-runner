@@ -23,6 +23,19 @@ The response has:
 - `strategy`: for `strategy()` scripts, the trade list and net profit from the PineTS broker emulator
 - `signals`: the strategy's position changes as `entry-long`, `exit-long`, `entry-short` and `exit-short` (TraderX's signal names), each with its decision bar and that bar's open time
 
+### Conditions
+
+Most indicators have no trading rules. Send `conditions` to set them: for any of `entry-long`, `exit-long`, `entry-short`, `exit-short`, a list of rules that must all hold on a bar.
+
+```json
+{ "conditions": {
+    "entry-long":  [{ "left": "plot:Fast", "op": "crosses_above", "right": { "series": "plot:Slow" } }],
+    "entry-short": [{ "left": "plot:RSI", "op": "crosses_below", "right": { "value": 70 } }],
+    "exit-long":   [{ "left": "alert:Sell", "op": "fires" }] } }
+```
+
+Series are `plot:<title>`, `price:open|high|low|close|volume` and, with `fires`, `alert:<alertcondition title>`. Operators: `crosses_above`, `crosses_below`, `above`, `below`, `fires`. The rules are played through one position (enter when flat, long wins a tie; exit on the side's exit rules; the opposite entry reverses), so `signals` holds only position changes, each on the bar its rules held. `signalSource` says whether signals came from `conditions` or the script's `strategy` calls.
+
 Errors in the script come back as `422` with a readable `error`.
 
 `GET /healthz` returns `{ "ok": true }`.

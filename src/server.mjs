@@ -69,7 +69,7 @@ async function readJson(req) {
 }
 
 export async function handleRun(body) {
-  const { source, coin, interval, bars, candles, inputs } = body ?? {};
+  const { source, coin, interval, bars, candles, inputs, conditions } = body ?? {};
   if (typeof source !== 'string' || !source.trim()) return [400, { error: 'source is required.' }];
   if (Buffer.byteLength(source) > MAX_SOURCE_BYTES) return [400, { error: 'Script is too long.' }];
   if (!TIMEFRAMES[interval]) return [400, { error: `interval must be one of ${Object.keys(TIMEFRAMES).join(', ')}.` }];
@@ -90,7 +90,7 @@ export async function handleRun(body) {
   if (running >= MAX_CONCURRENT) return [429, { error: 'Runner is busy, try again shortly.' }];
   running++;
   try {
-    const out = await runInWorker({ source, candles: series, interval, symbol: coin ?? 'COIN', inputs: inputs ?? {} });
+    const out = await runInWorker({ source, candles: series, interval, symbol: coin ?? 'COIN', inputs: inputs ?? {}, conditions: conditions ?? null });
     if (out.ok) return [200, out.result];
     return out.userError ? [422, { error: out.message }] : [500, { error: 'Script run failed.' }];
   } finally {

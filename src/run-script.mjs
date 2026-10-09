@@ -5,6 +5,10 @@
 // Pure: no network, no globals. The server calls it inside a worker thread.
 
 import { PineTS, Indicator } from 'pinets';
+import { UserError } from './errors.mjs';
+import { conditionsToSignals, hasConditions, validateConditions } from './conditions.mjs';
+
+export { UserError };
 
 /** Hyperliquid interval → PineTS/TradingView timeframe string. */
 export const TIMEFRAMES = {
@@ -25,11 +29,14 @@ const DRAWING_KEYS = new Set(['__labels__', '__lines__', '__boxes__', '__linefil
  * @param {string} req.interval Hyperliquid interval, e.g. "1h".
  * @param {string} [req.symbol]
  * @param {Record<string, unknown>} [req.inputs] Overrides keyed by input title.
+ * @param {Record<string, object[]>} [req.conditions] Rules set on our side (see conditions.mjs). When given, they decide
+ *   the signals instead of the script's own strategy calls.
  */
-export async function runScript({ source, candles, interval, symbol = 'COIN', inputs = {} }) {
+export async function runScript({ source, candles, interval, symbol = 'COIN', inputs = {}, conditions = null }) {
   const timeframe = TIMEFRAMES[interval];
   if (!timeframe) throw new UserError(`Unsupported interval "${interval}".`);
   if (!Array.isArray(candles) || candles.length === 0) throw new UserError('No candles to run on.');
+  validateConditions(conditions);
 
   const indicator = new Indicator(source, inputs);
   const declaration = indicator.getDeclarationType();
@@ -67,7 +74,10 @@ export async function runScript({ source, candles, interval, symbol = 'COIN', in
     plots,
     alerts,
     strategy,
-    signals: strategy ? strategy.signals : [],
+    signals: hasConditions(conditions)
+      ? conditionsToSignals(conditions, plots, alerts, candles)
+      : strategy ? strategy.signals : [],
+    signalSource: hasConditions(conditions) ? 'conditions' : strategy ? 'strategy' : 'none',
     warnings: (ctx.warnings ?? []).slice(0, 50),
   };
 }
@@ -169,5 +179,3 @@ export function mergeSignals(...lists) {
     .sort((a, b) => a.bar - b.bar || order[a.type] - order[b.type]);
 }
 
-/** A problem with the script or request, safe to show the user. */
-export class UserError extends Error {}

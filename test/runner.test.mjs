@@ -141,3 +141,74 @@ if ta.crossunder(f, s)
   assert.deepEqual(atLast, ['exit-short', 'entry-long']);
   assert.equal(live.signals.at(-1).time, all[crossBar].openTime);
 });
+
+// ── Conditions set on our side, for indicators with no trading rules ──────────────────────────────
+
+const EMA_INDICATOR = `//@version=5
+indicator("Two EMAs", overlay=true)
+plot(ta.ema(close, 5), "Fast")
+plot(ta.ema(close, 15), "Slow")
+alertcondition(ta.crossover(ta.ema(close, 5), ta.ema(close, 15)), "Cross up", "up")
+`;
+
+test('rules over plots turn an indicator into position changes', async () => {
+  const conditions = {
+    'entry-long': [{ left: 'plot:Fast', op: 'crosses_above', right: { series: 'plot:Slow' } }],
+    'entry-short': [{ left: 'plot:Fast', op: 'crosses_below', right: { series: 'plot:Slow' } }],
+  };
+  const out = await runScript({ source: EMA_INDICATOR, candles: zigzag(), interval: '1h', conditions });
+
+  assert.equal(out.declaration, 'indicator');
+  assert.equal(out.signalSource, 'conditions');
+  assert.ok(out.signals.length > 5);
+  // Same crosses as the EMA strategy test: every crossover after the first is a reversal (exit, then entry, one bar).
+  const byBar = Object.groupBy(out.signals, (s) => s.bar);
+  for (const group of Object.values(byBar).slice(1)) {
+    assert.equal(group.length, 2);
+    assert.ok(group[0].type.startsWith('exit-') && group[1].type.startsWith('entry-'));
+  }
+  // The first signal sits on the first crossover bar.
+  const fast = out.plots.Fast.map((p) => p.value), slow = out.plots.Slow.map((p) => p.value);
+  const firstCross = fast.findIndex((f, i) => i > 0 && fast[i - 1] != null && slow[i - 1] != null && ((fast[i - 1] <= slow[i - 1] && f > slow[i]) || (fast[i - 1] >= slow[i - 1] && f < slow[i])));
+  assert.equal(out.signals[0].bar, firstCross);
+});
+
+test('an exit rule closes without reversing, and an entry waits until flat', async () => {
+  const conditions = {
+    'entry-long': [{ left: 'price:close', op: 'above', right: { series: 'plot:Slow' } }],
+    'exit-long': [{ left: 'price:close', op: 'below', right: { series: 'plot:Fast' } }],
+  };
+  const out = await runScript({ source: EMA_INDICATOR, candles: zigzag(), interval: '1h', conditions });
+
+  const types = out.signals.map((s) => s.type);
+  assert.ok(types.length >= 4);
+  // Strictly alternating: one entry, then one exit, never two entries in a row although "above" holds for many bars.
+  types.forEach((t, i) => assert.equal(t, i % 2 === 0 ? 'entry-long' : 'exit-long'));
+});
+
+test('numbers and alerts work as rule inputs', async () => {
+  const byNumber = await runScript({
+    source: EMA_INDICATOR, candles: zigzag(), interval: '1h',
+    conditions: { 'entry-long': [{ left: 'price:close', op: 'crosses_above', right: { value: 110 } }] },
+  });
+  assert.ok(byNumber.signals.length >= 1);
+  assert.ok(byNumber.signals.every((s) => s.type === 'entry-long'));
+
+  const byAlert = await runScript({
+    source: EMA_INDICATOR, candles: zigzag(), interval: '1h',
+    conditions: { 'entry-long': [{ left: 'alert:Cross up', op: 'fires' }] },
+  });
+  assert.equal(byAlert.signals[0].bar, byAlert.alerts.find((a) => a.title === 'Cross up').bar);
+});
+
+test('rules that name something the script lacks are a readable error', async () => {
+  const [status, body] = await handleRun({
+    source: EMA_INDICATOR, interval: '1h', candles: zigzag(50),
+    conditions: { 'entry-long': [{ left: 'plot:Nope', op: 'above', right: { value: 1 } }] },
+  });
+  assert.equal(status, 422);
+  assert.match(body.error, /no plot named "Nope"/);
+
+  const [badShape] = await handleRun({ source: EMA_INDICATOR, interval: '1h', candles: zigzag(50), conditions: { 'entry-long': [{ left: 'plot:Fast', op: 'nearly' }] } });
+  assert.equal(badShape, 422);
+});
