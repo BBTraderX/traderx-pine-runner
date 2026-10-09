@@ -36,6 +36,17 @@ Most indicators have no trading rules. Send `conditions` to set them: for any of
 
 Series are `plot:<title>` (lines; an untitled plot is `Plot 1`, `Plot 2`…) and `price:open|high|low|close|volume`. With `fires`, an event from `events` in the response: `shape:<title>` (plotshape/plotchar arrows and characters), `background:<title>` (bgcolor shading), `label:<text>` (label.new; Pine keeps only the newest 50 by default, so labels cover recent history) and `alert:<alertcondition title>`. Operators: `crosses_above`, `crosses_below`, `above`, `below`, `fires`. The rules are played through one position (enter when flat, long wins a tie; exit on the side's exit rules; the opposite entry reverses), so `signals` holds only position changes, each on the bar its rules held. `signalSource` says whether signals came from `conditions` or the script's `strategy` calls.
 
+### AI mode: `POST /v1/search`
+
+Same body as `/v1/run` (without `conditions`). Finds the conditions that trade the indicator best, the way BB TraderX AI Studio's Find does:
+
+1. Runs the script at a few values of its first two numeric inputs (half to double the default).
+2. At each, builds every sensible rule from its output (line crosses, price vs line, oscillator levels, zero crosses, its arrows, labels and alerts, trend filters) and tests flips and one-sided trades with every exit, at Hyperliquid fees, filling at the next open.
+3. Keeps only sets with at least 12 trades that made money overall and in at least 3 of 4 periods of the first 80% of history.
+4. Grades the best on the last 20%, which the search never saw, against holding the coin, and returns the top five with their `conditions` and `inputs`.
+
+Stops at `SEARCH_TIMEOUT_MS` (120s). Its numbers are the search's own simulation; backtest the pick for the real figures.
+
 Errors in the script come back as `422` with a readable `error`.
 
 `GET /healthz` returns `{ "ok": true }`.

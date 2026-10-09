@@ -16,6 +16,8 @@ export const TOKEN = process.env.RUNNER_TOKEN ?? '';
 const RUN_TIMEOUT_MS = Number(process.env.RUN_TIMEOUT_MS ?? 15_000);
 const HEAP_MB = Number(process.env.RUN_HEAP_MB ?? 256);
 const MAX_CONCURRENT = Number(process.env.MAX_CONCURRENT ?? 4);
+/** AI mode tests thousands of condition sets; it gets longer, but still a hard stop. */
+const SEARCH_TIMEOUT_MS = Number(process.env.SEARCH_TIMEOUT_MS ?? 120_000);
 const MAX_SOURCE_BYTES = 100_000;
 const MAX_BODY_BYTES = 2_000_000;
 export const SOURCE_URL = process.env.SOURCE_URL ?? 'https://github.com/BBTraderX/traderx-pine-runner';
@@ -68,7 +70,7 @@ async function readJson(req) {
   }
 }
 
-export async function handleRun(body) {
+export async function handleRun(body, { search = false } = {}) {
   const { source, coin, interval, bars, candles, inputs, conditions } = body ?? {};
   if (typeof source !== 'string' || !source.trim()) return [400, { error: 'source is required.' }];
   if (Buffer.byteLength(source) > MAX_SOURCE_BYTES) return [400, { error: 'Script is too long.' }];
@@ -90,7 +92,10 @@ export async function handleRun(body) {
   if (running >= MAX_CONCURRENT) return [429, { error: 'Runner is busy, try again shortly.' }];
   running++;
   try {
-    const out = await runInWorker({ source, candles: series, interval, symbol: coin ?? 'COIN', inputs: inputs ?? {}, conditions: conditions ?? null });
+    const payload = { source, candles: series, interval, symbol: coin ?? 'COIN', inputs: inputs ?? {}, conditions: conditions ?? null };
+    const out = search
+      ? await runInWorker({ ...payload, mode: 'search', searchDeadlineMs: SEARCH_TIMEOUT_MS - 15_000 }, { timeoutMs: SEARCH_TIMEOUT_MS })
+      : await runInWorker(payload);
     if (out.ok) return [200, out.result];
     return out.userError ? [422, { error: out.message }] : [500, { error: 'Script run failed.' }];
   } finally {
@@ -102,9 +107,10 @@ export function createServer() {
   return http.createServer(async (req, res) => {
     try {
       if (req.method === 'GET' && req.url === '/healthz') return send(res, 200, { ok: true });
-      if (req.method !== 'POST' || req.url !== '/v1/run') return send(res, 404, { error: 'Not found.' });
+      const isSearch = req.url === '/v1/search';
+      if (req.method !== 'POST' || (req.url !== '/v1/run' && !isSearch)) return send(res, 404, { error: 'Not found.' });
       if (TOKEN && req.headers.authorization !== `Bearer ${TOKEN}`) return send(res, 401, { error: 'Unauthorized.' });
-      const [status, body] = await handleRun(await readJson(req));
+      const [status, body] = await handleRun(await readJson(req), { search: isSearch });
       return send(res, status, body);
     } catch (err) {
       return send(res, err.status ?? 500, { error: err.status ? err.message : 'Internal error.' });

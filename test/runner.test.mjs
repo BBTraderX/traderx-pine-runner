@@ -256,3 +256,43 @@ test('an arrow can drive the signals', async () => {
   assert.equal(out.signals.find((s) => s.type === 'entry-long').time, buys[0]);
   assert.ok(out.signals.some((s) => s.type === 'entry-short'));
 });
+
+// ── AI mode: search conditions and settings ────────────────────────────────────────────────────
+
+test('AI mode finds conditions that the condition engine reproduces', async () => {
+  // A noisy uptrend with swings, long enough for four search periods and an unseen stretch.
+  const candles = [];
+  let price = 100;
+  for (let i = 0; i < 1200; i++) {
+    price *= 1 + 0.0004 + 0.01 * Math.sin(i / 9) + 0.004 * Math.sin(i / 2.3);
+    const t = Date.UTC(2026, 0, 1) + i * 3600e3;
+    candles.push({ openTime: t, closeTime: t + 3600e3 - 1, open: price * 0.999, high: price * 1.004, low: price * 0.996, close: price, volume: 10 });
+  }
+  const source = `//@version=5
+indicator("EMAs", overlay=true)
+fast = input.int(9, "Fast")
+plot(ta.ema(close, fast), "Fast EMA")
+plot(ta.ema(close, 30), "Slow EMA")
+`;
+  const { sweepAndSearch } = await import('../src/sweep.mjs');
+  const out = await sweepAndSearch({ source, candles, interval: '1h' }, { deadlineMs: 60_000 });
+
+  assert.deepEqual(out.search.settingsSwept, ['Fast']);
+  assert.ok(out.search.tested > 100);
+  assert.ok(out.search.results.length > 0, 'expected at least one surviving candidate');
+  const best = out.search.results[0];
+  assert.ok(best.train.returnPct > 0);
+  assert.ok(best.train.periodsProfitable >= 3);
+  // Running the script with the chosen settings and conditions gives the same entries the search counted.
+  const replay = await runScript({ source, candles, interval: '1h', inputs: best.inputs, conditions: best.conditions });
+  assert.equal(replay.signals.filter((s) => s.type.startsWith('entry-')).length, best.entries);
+  assert.ok(replay.signals.length > 0);
+});
+
+test('the search endpoint answers with results and refuses a broken script', async () => {
+  const [ok, body] = await handleRun({ source: EMA_INDICATOR, interval: '1h', candles: zigzag(600) }, { search: true });
+  assert.equal(ok, 200);
+  assert.ok(Array.isArray(body.search.results));
+  const [bad] = await handleRun({ source: '//@version=5\nindicator("x")\nplot(ta.nope(close))\n', interval: '1h', candles: zigzag(100) }, { search: true });
+  assert.equal(bad, 422);
+});

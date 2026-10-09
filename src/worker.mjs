@@ -6,10 +6,17 @@
 
 import { parentPort, workerData } from 'node:worker_threads';
 import { runScript } from './run-script.mjs';
+import { sweepAndSearch } from './sweep.mjs';
 
 try {
-  const result = await runScript(workerData);
-  parentPort.postMessage({ ok: true, result });
+  if (workerData.mode === 'search') {
+    // AI mode: sweep the script's main settings and search conditions at each.
+    const result = await sweepAndSearch(workerData, { deadlineMs: workerData.searchDeadlineMs });
+    parentPort.postMessage({ ok: true, result });
+  } else {
+    const result = await runScript(workerData);
+    parentPort.postMessage({ ok: true, result });
+  }
 } catch (err) {
   parentPort.postMessage({ ok: false, userError: true, message: String(err?.message ?? err).slice(0, 2000) });
 }
