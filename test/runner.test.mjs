@@ -118,3 +118,26 @@ if ta.crossunder(f, s)
     assert.equal(entry.bar, crossBar, `process_orders_on_close=${onClose}`);
   }
 });
+
+test('a decision on the last bar is a signal now, before it fills', async () => {
+  // Live trading runs the script when a candle closes; an order placed on that candle fills only at the next open,
+  // so it isn't in the ledger yet. It must still come back as a signal on the bar that just closed.
+  const all = zigzag(120).map((c) => ({ ...c, open: c.close - 0.3 }));
+  const src = `//@version=5
+strategy("x", overlay=true)
+f = ta.ema(close, 5)
+s = ta.ema(close, 15)
+cu = ta.crossover(f, s)
+plot(cu ? 1 : 0, "cu")
+if cu
+    strategy.entry("L", strategy.long)
+if ta.crossunder(f, s)
+    strategy.entry("S", strategy.short)
+`;
+  const full = await runScript({ source: src, candles: all, interval: '1h' });
+  const crossBar = full.plots.cu.findIndex((p) => p.value === 1);
+  const live = await runScript({ source: src, candles: all.slice(0, crossBar + 1), interval: '1h' });
+  const atLast = live.signals.filter((s) => s.bar === crossBar).map((s) => s.type);
+  assert.deepEqual(atLast, ['exit-short', 'entry-long']);
+  assert.equal(live.signals.at(-1).time, all[crossBar].openTime);
+});

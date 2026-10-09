@@ -101,7 +101,8 @@ export function summarizeStrategy(state, candles = []) {
     profit: t.profit ?? null,
     status: t.status,
   }));
-  return { trades, signals: tradesToSignals(trades), netProfit: state.netprofit ?? 0, wins: state.wintrades ?? 0, losses: state.losstrades ?? 0 };
+  const signals = mergeSignals(tradesToSignals(trades), pendingSignals(state, candles));
+  return { trades, signals, netProfit: state.netprofit ?? 0, wins: state.wintrades ?? 0, losses: state.losstrades ?? 0 };
 }
 
 /**
@@ -124,6 +125,48 @@ export function tradesToSignals(trades) {
   }
   const order = { 'exit-long': 0, 'exit-short': 0, 'entry-long': 1, 'entry-short': 1 };
   return out.sort((a, b) => a.bar - b.bar || order[a.type] - order[b.type]);
+}
+
+/**
+ * Market orders the script placed on the last bar. They fill at the next bar's open, which hasn't happened yet, so they
+ * are not in the ledger. Live trading acts on exactly these: the decision just made on the candle that closed.
+ * Stop and limit orders are not decisions until they trigger, so they are left out.
+ */
+export function pendingSignals(state, candles) {
+  const last = candles.length - 1;
+  if (last < 0) return [];
+  const time = candles[last].openTime;
+  const price = candles[last].close;
+  const position = state.position_size ?? 0;
+  const out = [];
+  for (const o of state.pending_orders ?? []) {
+    if (o.status !== 'pending' || o.type !== 'market' || o.bar !== last) continue;
+    if (o.category === 'exit') {
+      if (position > 0) out.push({ type: 'exit-long', bar: last, time, price });
+      else if (position < 0) out.push({ type: 'exit-short', bar: last, time, price });
+      continue;
+    }
+    const long = o.direction > 0;
+    if (long && position < 0) out.push({ type: 'exit-short', bar: last, time, price });
+    if (!long && position > 0) out.push({ type: 'exit-long', bar: last, time, price });
+    if ((long && position <= 0) || (!long && position >= 0)) out.push({ type: long ? 'entry-long' : 'entry-short', bar: last, time, price });
+  }
+  return out;
+}
+
+/** Ledger and pending signals together, one per type and bar, exits before entries. */
+export function mergeSignals(...lists) {
+  const seen = new Set();
+  const order = { 'exit-long': 0, 'exit-short': 0, 'entry-long': 1, 'entry-short': 1 };
+  return lists
+    .flat()
+    .filter((s) => {
+      const key = `${s.type}:${s.bar}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .sort((a, b) => a.bar - b.bar || order[a.type] - order[b.type]);
 }
 
 /** A problem with the script or request, safe to show the user. */
