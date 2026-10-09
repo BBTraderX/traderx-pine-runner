@@ -51,7 +51,7 @@ export async function runScript({ source, candles, interval, symbol = 'COIN', in
 
   const alerts = (ctx.alerts ?? []).map((a) => ({ id: a.id, title: a.title ?? null, message: a.message, bar: a.bar_index, time: a.time }));
 
-  const strategy = ctx.strategy ? summarizeStrategy(ctx.strategy) : null;
+  const strategy = ctx.strategy ? summarizeStrategy(ctx.strategy, candles) : null;
 
   return {
     declaration,
@@ -65,14 +65,32 @@ export async function runScript({ source, candles, interval, symbol = 'COIN', in
   };
 }
 
-/** The ledger as trades plus the four TraderX signals, ordered by bar. */
-export function summarizeStrategy(state) {
+/**
+ * The ledger as trades plus the four TraderX signals, ordered by bar.
+ *
+ * The ledger records the bar an order FILLED on. TraderX acts on the bar a decision was made (a closed candle), so each
+ * signal carries the decision bar: the bar before a fill at that bar's open (a market order placed on the previous
+ * close, PineTS's default), else the fill bar itself. A stop or limit that fills mid-bar can't be known before that
+ * bar, so it signals on its fill bar and TraderX acts one bar later, never earlier than the script could have.
+ */
+export function summarizeStrategy(state, candles = []) {
+  const onClose = Boolean(state.config?.process_orders_on_close);
+  const decisionBar = (bar, price) => {
+    if (bar == null) return null;
+    if (onClose || bar === 0) return bar;
+    const open = candles[bar]?.open;
+    return open != null && Math.abs(price - open) <= Math.abs(open) * 1e-9 ? bar - 1 : bar;
+  };
   const all = [...(state.closedtrades ?? []), ...(state.opentrades ?? [])];
   const trades = all.map((t) => ({
     side: t.size > 0 ? 'long' : 'short',
     size: Math.abs(t.size),
-    entryBar: t.entry_bar_index, entryTime: t.entry_time, entryPrice: t.entry_price, entryId: t.entry_id,
-    exitBar: t.exit_bar_index ?? null, exitTime: t.exit_time ?? null, exitPrice: t.exit_price ?? null, exitId: t.exit_id ?? null,
+    entryBar: decisionBar(t.entry_bar_index, t.entry_price), entryFillBar: t.entry_bar_index,
+    entryDecisionTime: candles[decisionBar(t.entry_bar_index, t.entry_price)]?.openTime ?? t.entry_time,
+    entryTime: t.entry_time, entryPrice: t.entry_price, entryId: t.entry_id,
+    exitBar: decisionBar(t.exit_bar_index ?? null, t.exit_price), exitFillBar: t.exit_bar_index ?? null,
+    exitDecisionTime: t.exit_bar_index == null ? null : candles[decisionBar(t.exit_bar_index, t.exit_price)]?.openTime ?? t.exit_time,
+    exitTime: t.exit_time ?? null, exitPrice: t.exit_price ?? null, exitId: t.exit_id ?? null,
     profit: t.profit ?? null,
     status: t.status,
   }));
@@ -80,21 +98,22 @@ export function summarizeStrategy(state) {
 }
 
 /**
- * One signal per position change. Pyramided lots that open on the same bar and side collapse into one entry, and
+ * One signal per position change, timed by its decision bar's open time (what TraderX matches candles on). Pyramided lots that open on the same bar and side collapse into one entry, and
  * lots closed together into one exit. A reversal on one bar gives the exit before the new entry.
  */
 export function tradesToSignals(trades) {
   const seen = new Set();
   const out = [];
   const add = (type, bar, time, price) => {
+    if (bar == null) return;
     const key = `${type}:${bar}`;
     if (seen.has(key)) return;
     seen.add(key);
     out.push({ type, bar, time, price });
   };
   for (const t of trades) {
-    add(t.side === 'long' ? 'EntryLong' : 'EntryShort', t.entryBar, t.entryTime, t.entryPrice);
-    if (t.exitBar != null) add(t.side === 'long' ? 'ExitLong' : 'ExitShort', t.exitBar, t.exitTime, t.exitPrice);
+    add(t.side === 'long' ? 'EntryLong' : 'EntryShort', t.entryBar, t.entryDecisionTime ?? t.entryTime, t.entryPrice);
+    if (t.exitBar != null) add(t.side === 'long' ? 'ExitLong' : 'ExitShort', t.exitBar, t.exitDecisionTime ?? t.exitTime, t.exitPrice);
   }
   const order = { ExitLong: 0, ExitShort: 0, EntryLong: 1, EntryShort: 1 };
   return out.sort((a, b) => a.bar - b.bar || order[a.type] - order[b.type]);

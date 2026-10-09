@@ -94,3 +94,25 @@ test('a broken script is a 422 with a message, not a crash', async () => {
   assert.equal(status, 422);
   assert.ok(body.error.length > 0);
 });
+
+test('signals sit on the decision bar, the bar before a next-open fill', async () => {
+  // Crossover decided on bar k fills at bar k+1's open; TraderX must see the signal on bar k.
+  const candles = zigzag(120).map((c) => ({ ...c, open: c.close - 0.3 }));
+  for (const onClose of [false, true]) {
+    const src = `//@version=5
+strategy("x", overlay=true, process_orders_on_close=${onClose})
+f = ta.ema(close, 5)
+s = ta.ema(close, 15)
+cu = ta.crossover(f, s)
+plot(cu ? 1 : 0, "cu")
+if cu
+    strategy.entry("L", strategy.long)
+if ta.crossunder(f, s)
+    strategy.entry("S", strategy.short)
+`;
+    const out = await runScript({ source: src, candles, interval: '1h' });
+    const crossBar = out.plots.cu.findIndex((p) => p.value === 1);
+    const entry = out.signals.find((s) => s.type === 'EntryLong');
+    assert.equal(entry.bar, crossBar, `process_orders_on_close=${onClose}`);
+  }
+});
