@@ -1,0 +1,19 @@
+{
+  "name": "traderx-pine-runner",
+  "version": "0.1.0",
+  "description": "Runs Pine Script on Hyperliquid candles for BB TraderX. Built on PineTS.",
+  "main": "src/index.mjs",
+  "scripts": {
+    "start": "node src/index.mjs",
+    "test": "node --test test/*.test.mjs"
+  },
+  "license": "AGPL-3.0-only",
+  "type": "module",
+  "dependencies": {
+    "pinets": "0.11.0"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "private": false
+}
