@@ -13,13 +13,17 @@
 import { UserError } from './errors.mjs';
 
 export const OPERATORS = ['crosses_above', 'crosses_below', 'above', 'below', 'fires'];
+/** Series that are events (they happen on a bar or not), used with `fires`. */
+export const EVENT_PREFIXES = ['alert:', 'shape:', 'background:', 'label:'];
+const isEvent = (name) => EVENT_PREFIXES.some((p) => name.startsWith(p));
 const SIGNALS = ['entry-long', 'exit-long', 'entry-short', 'exit-short'];
 const PRICE = ['open', 'high', 'low', 'close', 'volume'];
 const MAX_RULES = 8;
 
 /**
  * @typedef {{ left: string, op: string, right?: { series?: string, value?: number } }} Rule
- * Series names: `plot:<title>`, `price:<open|high|low|close|volume>`, and for `fires`, `alert:<title>`.
+ * Series names: `plot:<title>`, `price:<open|high|low|close|volume>`, and for `fires`, an event:
+ * `alert:<title>`, `shape:<title>` (plotshape/plotchar), `background:<title>` (bgcolor), `label:<text>` (label.new).
  */
 
 /** Throws a UserError for anything malformed, before the script runs. */
@@ -33,7 +37,7 @@ export function validateConditions(conditions) {
     for (const rule of rules) {
       if (!rule || typeof rule.left !== 'string' || !OPERATORS.includes(rule.op)) throw new UserError(`A rule for ${signal} is incomplete.`);
       if (rule.op === 'fires') {
-        if (!rule.left.startsWith('alert:')) throw new UserError('"fires" only applies to an alert.');
+        if (!isEvent(rule.left)) throw new UserError('"fires" only applies to an alert, arrow, label or background.');
         continue;
       }
       const right = rule.right ?? {};
@@ -50,11 +54,12 @@ export function hasConditions(conditions) {
 /**
  * @param {Record<string, Rule[]>} conditions
  * @param {Record<string, {time:number, value:number|null}[]>} plots
- * @param {{time:number, title:string|null, id:string}[]} alerts
+ * @param {{key:string, times:number[]}[]} events Arrows, background shading, labels and alerts, by key.
  * @param {{openTime:number, open:number, high:number, low:number, close:number, volume:number}[]} candles
  */
-export function conditionsToSignals(conditions, plots, alerts, candles) {
+export function conditionsToSignals(conditions, plots, events, candles) {
   const n = candles.length;
+  const eventTimes = new Map(events.map((e) => [e.key, e.times]));
   const barByTime = new Map(candles.map((c, i) => [c.openTime, i]));
 
   const seriesCache = new Map();
@@ -73,13 +78,11 @@ export function conditionsToSignals(conditions, plots, alerts, candles) {
         const i = barByTime.get(p.time);
         if (i != null) values[i] = p.value;
       }
-    } else if (name.startsWith('alert:')) {
-      const title = name.slice(6);
-      // An alertcondition that never fired has no events; it just never holds.
+    } else if (isEvent(name)) {
+      // An event that never happened has no entry; it just never holds.
       values = new Array(n).fill(false);
-      for (const a of alerts) {
-        if ((a.title ?? a.id) !== title) continue;
-        const i = barByTime.get(a.time);
+      for (const t of eventTimes.get(name) ?? []) {
+        const i = barByTime.get(t);
         if (i != null) values[i] = true;
       }
     } else {

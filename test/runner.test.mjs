@@ -212,3 +212,47 @@ test('rules that name something the script lacks are a readable error', async ()
   const [badShape] = await handleRun({ source: EMA_INDICATOR, interval: '1h', candles: zigzag(50), conditions: { 'entry-long': [{ left: 'plot:Fast', op: 'nearly' }] } });
   assert.equal(badShape, 422);
 });
+
+// ── Indicators that signal with arrows, shading or labels instead of lines ──────────────────────
+
+const ARROWS = `//@version=5
+indicator("Arrows", overlay=true)
+f = ta.ema(close, 5)
+s = ta.ema(close, 15)
+up = ta.crossover(f, s)
+dn = ta.crossunder(f, s)
+plot(f)
+plotshape(up, title="Buy", style=shape.triangleup, location=location.belowbar)
+plotchar(dn, title="Sell", char="S")
+bgcolor(up ? color.new(color.green, 80) : na, title="Up bar")
+if up
+    label.new(bar_index, low, "BUY")
+`;
+
+test('arrows, characters, shading and labels come back as events, unnamed lines get names', async () => {
+  const out = await runScript({ source: ARROWS, candles: zigzag(), interval: '1h' });
+
+  assert.deepEqual(Object.keys(out.plots), ['Plot 1']);
+  const byKey = Object.fromEntries(out.events.map((e) => [e.key, e]));
+  assert.equal(byKey['shape:Buy'].kind, 'shape');
+  assert.equal(byKey['shape:Sell'].kind, 'char');
+  assert.equal(byKey['background:Up bar'].kind, 'background');
+  assert.equal(byKey['label:BUY'].kind, 'label');
+  // Same crossovers four ways.
+  assert.ok(byKey['shape:Buy'].times.length > 2);
+  assert.deepEqual(byKey['background:Up bar'].times, byKey['shape:Buy'].times);
+  assert.deepEqual(byKey['label:BUY'].times, byKey['shape:Buy'].times.slice(-byKey['label:BUY'].times.length));
+});
+
+test('an arrow can drive the signals', async () => {
+  const out = await runScript({
+    source: ARROWS, candles: zigzag(), interval: '1h',
+    conditions: {
+      'entry-long': [{ left: 'shape:Buy', op: 'fires' }],
+      'entry-short': [{ left: 'shape:Sell', op: 'fires' }],
+    },
+  });
+  const buys = out.events.find((e) => e.key === 'shape:Buy').times;
+  assert.equal(out.signals.find((s) => s.type === 'entry-long').time, buys[0]);
+  assert.ok(out.signals.some((s) => s.type === 'entry-short'));
+});

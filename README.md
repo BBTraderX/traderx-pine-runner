@@ -34,7 +34,7 @@ Most indicators have no trading rules. Send `conditions` to set them: for any of
     "exit-long":   [{ "left": "alert:Sell", "op": "fires" }] } }
 ```
 
-Series are `plot:<title>`, `price:open|high|low|close|volume` and, with `fires`, `alert:<alertcondition title>`. Operators: `crosses_above`, `crosses_below`, `above`, `below`, `fires`. The rules are played through one position (enter when flat, long wins a tie; exit on the side's exit rules; the opposite entry reverses), so `signals` holds only position changes, each on the bar its rules held. `signalSource` says whether signals came from `conditions` or the script's `strategy` calls.
+Series are `plot:<title>` (lines; an untitled plot is `Plot 1`, `Plot 2`…) and `price:open|high|low|close|volume`. With `fires`, an event from `events` in the response: `shape:<title>` (plotshape/plotchar arrows and characters), `background:<title>` (bgcolor shading), `label:<text>` (label.new; Pine keeps only the newest 50 by default, so labels cover recent history) and `alert:<alertcondition title>`. Operators: `crosses_above`, `crosses_below`, `above`, `below`, `fires`. The rules are played through one position (enter when flat, long wins a tie; exit on the side's exit rules; the opposite entry reverses), so `signals` holds only position changes, each on the bar its rules held. `signalSource` says whether signals came from `conditions` or the script's `strategy` calls.
 
 Errors in the script come back as `422` with a readable `error`.
 

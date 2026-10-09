@@ -50,13 +50,53 @@ export async function runScript({ source, candles, interval, symbol = 'COIN', in
   pine.setAlertMode('all');
   const ctx = await pine.run(indicator);
 
+  // Lines (plot, hline) are numeric series. Arrows and characters (plotshape, plotchar) are true/false per bar, and
+  // background shading (bgcolor) is a color per bar: those are events, like alerts and labels.
   const plots = {};
-  for (const [title, plot] of Object.entries(ctx.plots ?? {})) {
-    if (DRAWING_KEYS.has(title)) continue;
-    plots[title] = (plot.data ?? []).map((p) => ({ time: p.time, value: Number.isFinite(p.value) ? p.value : null }));
+  const events = [];
+  for (const [rawTitle, plot] of Object.entries(ctx.plots ?? {})) {
+    if (DRAWING_KEYS.has(rawTitle)) continue;
+    // An untitled plot comes back as "#0", "#1"…; name it the way TradingView's legend does.
+    const title = /^#\d+$/.test(rawTitle) ? `Plot ${Number(rawTitle.slice(1)) + 1}` : rawTitle;
+    const data = plot.data ?? [];
+    // bgcolor: true on shaded bars.
+    if (plot.options?.style === 'background') {
+      events.push({ key: `background:${title}`, title, kind: 'background', times: data.filter((p) => p.value === true || p.options?.color).map((p) => p.time) });
+      continue;
+    }
+    if (data.some((p) => typeof p.value === 'boolean')) {
+      events.push({
+        key: `shape:${title}`,
+        title,
+        kind: data.some((p) => p.options?.char) ? 'char' : 'shape',
+        times: data.filter((p) => p.value === true).map((p) => p.time),
+      });
+      continue;
+    }
+    plots[title] = data.map((p) => ({ time: p.time, value: Number.isFinite(p.value) ? p.value : null }));
   }
 
+  // Labels (label.new), grouped by their text. Pine keeps only the newest max_labels_count (50 by default), so older
+  // ones are gone by the end of the run and labels cover recent history only.
+  const labelsByText = new Map();
+  for (const label of ctx.plots?.__labels__?.data?.[0]?.value ?? []) {
+    const text = String(label.text ?? '').trim();
+    if (!text) continue;
+    const time = label.xloc === 'bt' ? label.x : candles[label.x]?.openTime;
+    if (time == null) continue;
+    if (!labelsByText.has(text)) labelsByText.set(text, []);
+    labelsByText.get(text).push(time);
+  }
+  for (const [text, times] of labelsByText) events.push({ key: `label:${text}`, title: text, kind: 'label', times: times.sort((a, b) => a - b) });
+
   const alerts = (ctx.alerts ?? []).map((a) => ({ id: a.id, title: a.title ?? null, message: a.message, bar: a.bar_index, time: a.time }));
+  const alertTimes = new Map();
+  for (const a of alerts) {
+    const title = a.title ?? a.id;
+    if (!alertTimes.has(title)) alertTimes.set(title, []);
+    alertTimes.get(title).push(a.time);
+  }
+  for (const [title, times] of alertTimes) events.push({ key: `alert:${title}`, title, kind: 'alert', times });
 
   const strategy = ctx.strategy ? summarizeStrategy(ctx.strategy, candles) : null;
 
@@ -72,10 +112,12 @@ export async function runScript({ source, candles, interval, symbol = 'COIN', in
     /** Open time of the first bar and close time of the last, so a backtest can use the same window. */
     range: { from: candles[0].openTime, to: candles.at(-1).closeTime ?? candles.at(-1).openTime },
     plots,
+    /** Arrows, characters, background shading, labels and alerts, as things that happen on bars (key: kind:title). */
+    events,
     alerts,
     strategy,
     signals: hasConditions(conditions)
-      ? conditionsToSignals(conditions, plots, alerts, candles)
+      ? conditionsToSignals(conditions, plots, events, candles)
       : strategy ? strategy.signals : [],
     signalSource: hasConditions(conditions) ? 'conditions' : strategy ? 'strategy' : 'none',
     warnings: (ctx.warnings ?? []).slice(0, 50),
