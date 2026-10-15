@@ -1,6 +1,7 @@
 FROM node:24-alpine
 WORKDIR /app
 COPY package.json package-lock.json ./
+COPY vendor ./vendor
 RUN npm ci --omit=dev && npm cache clean --force
 COPY src ./src
 COPY LICENSE README.md ./

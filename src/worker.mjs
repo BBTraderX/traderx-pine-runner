@@ -25,6 +25,12 @@ const loadCandles = (coin, interval, startTime, endTime) =>
     parentPort.postMessage({ type: 'candles', id, coin, interval, startTime, endTime });
   });
 
+// PineTS loads request.security candles in a promise it never catches, so a failed load ("Could not load BTC
+// candles…") would otherwise kill the worker and come back as an internal error instead of the user's.
+process.on('unhandledRejection', (err) => {
+  parentPort.postMessage({ ok: false, userError: true, message: String(err?.message ?? err).slice(0, 2000) });
+});
+
 try {
   const req = { ...workerData, loadCandles };
   if (workerData.mode === 'search') {

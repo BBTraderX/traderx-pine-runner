@@ -61,10 +61,7 @@ Errors in the script come back as `422` with a readable `error`.
 
 `request.security` loads any other timeframe or Hyperliquid coin from Hyperliquid (`syminfo.tickerid` is the run's coin). Timeframes Hyperliquid has no candles for, such as 10, 45 or 360 (6h), are built from a smaller one that divides them. A run may load at most 24 of them, and each is limited to its latest 5,000 candles, so a 1-minute series reaches back about 3.5 days.
 
-Two PineTS limits to know:
-
-- Call `request.security` directly, not from inside your own function that is called more than once: PineTS loses the result of the second call. Wrap the expression in a function instead (`request.security(syminfo.tickerid, "240", myValues())`).
-- A lower timeframe that does not divide the chart's (45 on a 1h chart) has a value only on bars where a whole 45-minute bar fits inside the chart bar.
+One PineTS limit to know: a lower timeframe that does not divide the chart's (45 on a 1h chart) has a value only on bars where a whole 45-minute bar fits inside the chart bar.
 
 ## Running
 
@@ -75,6 +72,10 @@ npm test
 ```
 
 Or `docker build -t traderx-pine-runner .` and run it with `RUNNER_TOKEN` set.
+
+## PineTS
+
+The runner uses PineTS 0.11.0 with one fix, built from source and vendored in `vendor/`: `request.security` inside a user function that is called from several places (one call per timeframe, say) failed with "Cannot read properties of undefined", because the slice PineTS runs for the other timeframe only reached the function's first call. The change is `vendor/pinets-0.11.0-traderx.1.patch`, against [LuxAlgo/PineTS](https://github.com/LuxAlgo/PineTS) at `v0.11.0`; to rebuild, apply it there, `npm ci && npm run build:prod:all`, set the version to `0.11.0-traderx.1` and `npm pack`.
 
 ## License
 

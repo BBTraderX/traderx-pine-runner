@@ -341,3 +341,23 @@ plot(close)
   assert.equal(out.alerts[0].message, 'going up');
   assert.deepEqual(out.events.filter((e) => e.kind === 'alert').map((e) => e.key), ['alert:Up']);
 });
+
+test('request.security inside a helper called once per timeframe works for every call', async () => {
+  const start = Date.UTC(2026, 0, 1);
+  const candles = clock('1h', start, start + 200 * 3600e3);
+  const loadCandles = async (coin, interval, s, e) => clock(interval, s, e);
+  const source = `//@version=5
+indicator("Helper")
+get(sym, tf) =>
+    [c, o] = request.security(sym, tf, [close, open])
+    c
+plot(get(syminfo.tickerid, "240"), "h4")
+plot(get(syminfo.tickerid, "120"), "h2")
+`;
+  const out = await runScript({ source, candles, interval: '1h', symbol: 'BTC', loadCandles });
+  // The 13:00 bar closes at 14:00: the 2h bar 12:00-14:00 closes with it, the 4h bar 12:00-16:00 is still open
+  // (so 4h shows the 08:00-12:00 bar), as on TradingView.
+  const i = candles.findIndex((c) => c.openTime === start + 13 * 3600e3);
+  assert.equal(out.plots.h4[i].value, (start + 12 * 3600e3) / 60e3);
+  assert.equal(out.plots.h2[i].value, (start + 14 * 3600e3) / 60e3);
+});

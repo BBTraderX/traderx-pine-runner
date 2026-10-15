@@ -36,12 +36,18 @@ async function cached(key, coin, interval, startTime, endTime) {
   const hit = cache.get(key);
   if (hit && Date.now() - hit.at < CACHE_MS) return hit.candles;
 
-  const res = await fetch(HL_INFO, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ type: 'candleSnapshot', req: { coin, interval, startTime, endTime } }),
-    signal: AbortSignal.timeout(15_000),
-  });
+  let res;
+  // Multi-timeframe scripts load several series at once; ride out a brief rate limit (429) rather than fail the run.
+  for (let attempt = 0; ; attempt++) {
+    res = await fetch(HL_INFO, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ type: 'candleSnapshot', req: { coin, interval, startTime, endTime } }),
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (res.status !== 429 || attempt === 2) break;
+    await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
+  }
   if (!res.ok) throw new Error(`Hyperliquid candles: HTTP ${res.status}`);
   const raw = await res.json();
   if (!Array.isArray(raw)) throw new Error('Hyperliquid candles: unexpected response');
