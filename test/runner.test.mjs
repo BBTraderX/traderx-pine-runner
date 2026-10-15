@@ -296,3 +296,48 @@ test('the search endpoint answers with results and refuses a broken script', asy
   const [bad] = await handleRun({ source: '//@version=5\nindicator("x")\nplot(ta.nope(close))\n', interval: '1h', candles: zigzag(100) }, { search: true });
   assert.equal(bad, 422);
 });
+
+// Candles whose close is their close time in minutes, so any timeframe's close is easy to check.
+const STEP = { '1h': 3600e3, '2h': 7200e3, '4h': 14400e3 };
+function clock(interval, startTime, endTime) {
+  const step = STEP[interval];
+  const out = [];
+  for (let t = Math.ceil(startTime / step) * step; t < endTime; t += step) {
+    const c = (t + step) / 60e3;
+    out.push({ openTime: t, closeTime: t + step - 1, open: c, high: c, low: c, close: c, volume: 1 });
+  }
+  return out;
+}
+
+test('request.security loads other timeframes, building ones Hyperliquid lacks', async () => {
+  const start = Date.UTC(2026, 0, 1);
+  const candles = clock('1h', start, start + 200 * 3600e3);
+  const asked = [];
+  const loadCandles = async (coin, interval, s, e) => { asked.push(`${coin} ${interval}`); return clock(interval, s, e); };
+  const source = `//@version=5
+indicator("MTF")
+plot(request.security(syminfo.tickerid, "240", close), "h4")
+plot(request.security(syminfo.tickerid, "360", close), "h6")
+`;
+  const out = await runScript({ source, candles, interval: '1h', symbol: 'BTC', loadCandles });
+
+  assert.deepEqual(asked.sort(), ['BTC 2h', 'BTC 4h']);
+  // At 13:00 the last closed 4h bar is 08:00-12:00 and the last closed 6h bar is 06:00-12:00: both close at 12:00.
+  const i = candles.findIndex((c) => c.openTime === start + 13 * 3600e3);
+  const noon = (start + 12 * 3600e3) / 60e3;
+  assert.equal(out.plots.h4[i].value, noon);
+  assert.equal(out.plots.h6[i].value, noon);
+});
+
+test('alertcondition with named title and message keeps its title', async () => {
+  const source = `//@version=5
+indicator("A")
+alertcondition(close > close[1], title="Up", message="going up")
+plot(close)
+`;
+  const out = await runScript({ source, candles: zigzag(100), interval: '1h' });
+  assert.ok(out.alerts.length > 0);
+  assert.equal(out.alerts[0].title, 'Up');
+  assert.equal(out.alerts[0].message, 'going up');
+  assert.deepEqual(out.events.filter((e) => e.kind === 'alert').map((e) => e.key), ['alert:Up']);
+});

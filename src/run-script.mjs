@@ -2,11 +2,13 @@
 // the script's inputs, its plots, its alerts, and, for strategy() scripts, the trade ledger
 // turned into the four signals TraderX executes (entry long, exit long, entry short, exit short).
 //
-// Pure: no network, no globals. The server calls it inside a worker thread.
+// No globals. The only network use is request.security loading other timeframes or symbols from Hyperliquid
+// (see provider.mjs). The server calls it inside a worker thread.
 
 import { PineTS, Indicator } from 'pinets';
 import { UserError } from './errors.mjs';
 import { conditionsToSignals, hasConditions, validateConditions } from './conditions.mjs';
+import { createProvider } from './provider.mjs';
 
 export { UserError };
 
@@ -31,8 +33,10 @@ const DRAWING_KEYS = new Set(['__labels__', '__lines__', '__boxes__', '__linefil
  * @param {Record<string, unknown>} [req.inputs] Overrides keyed by input title.
  * @param {Record<string, object[]>} [req.conditions] Rules set on our side (see conditions.mjs). When given, they decide
  *   the signals instead of the script's own strategy calls.
+ * @param {Function} [req.loadCandles] (coin, interval, startTime, endTime) → candles, for request.security. The worker
+ *   passes one that asks the parent process; without it, candles are fetched from Hyperliquid directly.
  */
-export async function runScript({ source, candles, interval, symbol = 'COIN', inputs = {}, conditions = null }) {
+export async function runScript({ source, candles, interval, symbol = 'COIN', inputs = {}, conditions = null, loadCandles }) {
   const timeframe = TIMEFRAMES[interval];
   if (!timeframe) throw new UserError(`Unsupported interval "${interval}".`);
   if (!Array.isArray(candles) || candles.length === 0) throw new UserError('No candles to run on.');
@@ -45,7 +49,8 @@ export async function runScript({ source, candles, interval, symbol = 'COIN', in
     options: i.options, minval: i.minval, maxval: i.maxval, step: i.step, group: i.group, tooltip: i.tooltip,
   }));
 
-  const pine = new PineTS(candles, symbol, timeframe);
+  // A provider rather than the bare candles, so request.security can load other timeframes and symbols.
+  const pine = new PineTS(createProvider({ coin: symbol, timeframe, candles, loadCandles }), symbol, timeframe);
   // Backtests need every historical alert, not only those on a live bar (TradingView's default).
   pine.setAlertMode('all');
   const ctx = await pine.run(indicator);
@@ -89,7 +94,11 @@ export async function runScript({ source, candles, interval, symbol = 'COIN', in
   }
   for (const [text, times] of labelsByText) events.push({ key: `label:${text}`, title: text, kind: 'label', times: times.sort((a, b) => a - b) });
 
-  const alerts = (ctx.alerts ?? []).map((a) => ({ id: a.id, title: a.title ?? null, message: a.message, bar: a.bar_index, time: a.time }));
+  // alertcondition(cond, title=..., message=...) with named arguments comes back from PineTS as title: { title, message }.
+  const alerts = (ctx.alerts ?? []).map((a) => {
+    const named = a.title && typeof a.title === 'object' ? a.title : null;
+    return { id: a.id, title: (named ? named.title : a.title) ?? null, message: (named ? named.message : a.message) ?? '', bar: a.bar_index, time: a.time };
+  });
   const alertTimes = new Map();
   for (const a of alerts) {
     const title = a.title ?? a.id;

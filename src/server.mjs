@@ -4,18 +4,19 @@
 //   GET  /healthz
 //
 // Every run happens in its own worker thread with a wall-clock timeout and a heap cap. The worker gets
-// candles from this process, so the script itself never needs the network.
+// candles from this process, so the script itself never needs the network: when request.security wants another
+// timeframe or symbol, the worker asks this process, which loads it from Hyperliquid through one shared cache.
 
 import http from 'node:http';
 import { Worker } from 'node:worker_threads';
-import { fetchCandles, MAX_BARS } from './candles.mjs';
+import { fetchCandleRange, fetchCandles, MAX_BARS } from './candles.mjs';
 import { TIMEFRAMES } from './run-script.mjs';
 
 export const PORT = Number(process.env.PORT ?? 8787);
 export const TOKEN = process.env.RUNNER_TOKEN ?? '';
-const RUN_TIMEOUT_MS = Number(process.env.RUN_TIMEOUT_MS ?? 15_000);
-const HEAP_MB = Number(process.env.RUN_HEAP_MB ?? 256);
-const MAX_CONCURRENT = Number(process.env.MAX_CONCURRENT ?? 4);
+const RUN_TIMEOUT_MS = Number(process.env.RUN_TIMEOUT_MS ?? 30_000);
+const HEAP_MB = Number(process.env.RUN_HEAP_MB ?? 512);
+const MAX_CONCURRENT = Number(process.env.MAX_CONCURRENT ?? 3);
 /** AI mode tests thousands of condition sets; it gets longer, but still a hard stop. */
 const SEARCH_TIMEOUT_MS = Number(process.env.SEARCH_TIMEOUT_MS ?? 120_000);
 const MAX_SOURCE_BYTES = 100_000;
@@ -42,7 +43,14 @@ export function runInWorker(payload, { timeoutMs = RUN_TIMEOUT_MS, heapMb = HEAP
       () => done({ ok: false, userError: true, message: `Script took longer than ${timeoutMs / 1000}s and was stopped.` }),
       timeoutMs,
     );
-    worker.once('message', done);
+    worker.on('message', (msg) => {
+      if (msg?.type !== 'candles') return done(msg);
+      // request.security wants another timeframe or symbol: load it here, through the shared cache.
+      fetchCandleRange(msg.coin, msg.interval, msg.startTime, msg.endTime).then(
+        (candles) => !settled && worker.postMessage({ id: msg.id, candles }),
+        (err) => !settled && worker.postMessage({ id: msg.id, error: String(err?.message ?? err) }),
+      );
+    });
     worker.once('error', (err) =>
       done({ ok: false, userError: err?.code === 'ERR_WORKER_OUT_OF_MEMORY', message: err?.code === 'ERR_WORKER_OUT_OF_MEMORY' ? 'Script used too much memory and was stopped.' : String(err?.message ?? err) }),
     );

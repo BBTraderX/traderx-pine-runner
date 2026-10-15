@@ -18,15 +18,28 @@ export async function fetchCandles(coin, interval, bars = 1000) {
   const step = INTERVAL_MS[interval];
   if (!step) throw new Error(`Unsupported interval "${interval}".`);
   const count = Math.min(Math.max(1, bars | 0), MAX_BARS);
-  const key = `${coin}|${interval}|${count}`;
+  const endTime = Date.now();
+  return cached(`${coin}|${interval}|${count}`, coin, interval, endTime - count * step, endTime);
+}
+
+/** Candles opening between startTime and endTime, at most the latest MAX_BARS of them. */
+export async function fetchCandleRange(coin, interval, startTime, endTime) {
+  const step = INTERVAL_MS[interval];
+  if (!step) throw new Error(`Unsupported interval "${interval}".`);
+  // Rounded to the bar, so runs within the same bar share the cache.
+  const end = Math.ceil(endTime / step) * step;
+  const start = Math.max(Math.floor(startTime / step) * step, end - MAX_BARS * step);
+  return cached(`${coin}|${interval}|${start}|${end}`, coin, interval, start, end);
+}
+
+async function cached(key, coin, interval, startTime, endTime) {
   const hit = cache.get(key);
   if (hit && Date.now() - hit.at < CACHE_MS) return hit.candles;
 
-  const endTime = Date.now();
   const res = await fetch(HL_INFO, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ type: 'candleSnapshot', req: { coin, interval, startTime: endTime - count * step, endTime } }),
+    body: JSON.stringify({ type: 'candleSnapshot', req: { coin, interval, startTime, endTime } }),
     signal: AbortSignal.timeout(15_000),
   });
   if (!res.ok) throw new Error(`Hyperliquid candles: HTTP ${res.status}`);

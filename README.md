@@ -53,9 +53,18 @@ Errors in the script come back as `422` with a readable `error`.
 
 ## Limits
 
-- Each run happens in its own worker thread, stopped after `RUN_TIMEOUT_MS` (15s) or `RUN_HEAP_MB` (256 MB).
-- At most `MAX_CONCURRENT` (4) runs at once; extra requests get `429`.
+- Each run happens in its own worker thread, stopped after `RUN_TIMEOUT_MS` (30s) or `RUN_HEAP_MB` (512 MB).
+- At most `MAX_CONCURRENT` (3) runs at once; extra requests get `429`.
 - Hyperliquid keeps only the latest 5,000 candles per coin and interval.
+
+## Other timeframes and symbols
+
+`request.security` loads any other timeframe or Hyperliquid coin from Hyperliquid (`syminfo.tickerid` is the run's coin). Timeframes Hyperliquid has no candles for, such as 10, 45 or 360 (6h), are built from a smaller one that divides them. A run may load at most 24 of them, and each is limited to its latest 5,000 candles, so a 1-minute series reaches back about 3.5 days.
+
+Two PineTS limits to know:
+
+- Call `request.security` directly, not from inside your own function that is called more than once: PineTS loses the result of the second call. Wrap the expression in a function instead (`request.security(syminfo.tickerid, "240", myValues())`).
+- A lower timeframe that does not divide the chart's (45 on a 1h chart) has a value only on bars where a whole 45-minute bar fits inside the chart bar.
 
 ## Running
 
