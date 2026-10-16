@@ -10,11 +10,12 @@
 import http from 'node:http';
 import { Worker } from 'node:worker_threads';
 import { fetchCandleRange, fetchCandles, MAX_BARS } from './candles.mjs';
+import { prefetchTimeframes } from './provider.mjs';
 import { TIMEFRAMES } from './run-script.mjs';
 
 export const PORT = Number(process.env.PORT ?? 8787);
 export const TOKEN = process.env.RUNNER_TOKEN ?? '';
-const RUN_TIMEOUT_MS = Number(process.env.RUN_TIMEOUT_MS ?? 30_000);
+const RUN_TIMEOUT_MS = Number(process.env.RUN_TIMEOUT_MS ?? 60_000);
 const HEAP_MB = Number(process.env.RUN_HEAP_MB ?? 512);
 const MAX_CONCURRENT = Number(process.env.MAX_CONCURRENT ?? 3);
 /** AI mode tests thousands of condition sets; it gets longer, but still a hard stop. */
@@ -100,6 +101,9 @@ export async function handleRun(body, { search = false } = {}) {
   if (running >= MAX_CONCURRENT) return [429, { error: 'Runner is busy, try again shortly.' }];
   running++;
   try {
+    if (typeof coin === 'string' && coin.trim()) {
+      prefetchTimeframes({ source, coin: coin.trim(), timeframe: TIMEFRAMES[interval], candles: series });
+    }
     const payload = { source, candles: series, interval, symbol: coin ?? 'COIN', inputs: inputs ?? {}, conditions: conditions ?? null };
     const out = search
       ? await runInWorker({ ...payload, mode: 'search', searchDeadlineMs: SEARCH_TIMEOUT_MS - 15_000 }, { timeoutMs: SEARCH_TIMEOUT_MS })

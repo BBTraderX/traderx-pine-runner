@@ -34,6 +34,39 @@ function normalize(tf) {
   }
 }
 
+/** How far before the chart's first bar PineTS 0.11 asks for another timeframe's candles. */
+const LOOKBACK_MS = 30 * 86_400_000;
+
+/** Hyperliquid interval that serves a Pine timeframe, directly or as the bars it is built from. */
+function sourceInterval(tf) {
+  if (HL_INTERVALS[tf]) return HL_INTERVALS[tf];
+  const sub = /^\d+$|^\d*[DWM]$/.test(tf) ? selectSubTimeframe(tf, SUPPORTED) : null;
+  return sub ? HL_INTERVALS[sub] : null;
+}
+
+/**
+ * Start loading, all at once, the other timeframes a script looks likely to ask for. PineTS asks for them one
+ * after another as the script reaches each request.security, which for a script that reads a dozen timeframes is
+ * most of its run on a slow host. Timeframes are guessed from the script's string literals, so a guess can be
+ * wrong; the script's own requests then load as usual and these just warm the cache. Errors are left to those.
+ */
+export function prefetchTimeframes({ source, coin, timeframe, candles, loadCandles = fetchCandleRange }) {
+  if (!/\brequest\.security/.test(source) || !candles.length) return 0;
+  const chartTf = normalize(timeframe);
+  const intervals = new Set();
+  for (const [, , text] of source.matchAll(/(["'])([^"'\n]{1,5})\1/g)) {
+    const tf = normalize(text);
+    const interval = tf !== chartTf && sourceInterval(tf);
+    if (interval) intervals.add(interval);
+  }
+  const start = candles[0].openTime - LOOKBACK_MS;
+  const end = candles.at(-1).closeTime;
+  for (const interval of [...intervals].slice(0, MAX_FEEDS)) {
+    Promise.resolve(loadCandles(coin, interval, start, end)).catch(() => {});
+  }
+  return Math.min(intervals.size, MAX_FEEDS);
+}
+
 const kline = (c) => ({
   ...c, quoteAssetVolume: 0, numberOfTrades: 0, takerBuyBaseAssetVolume: 0, takerBuyQuoteAssetVolume: 0, ignore: 0,
 });

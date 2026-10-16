@@ -361,3 +361,48 @@ plot(get(syminfo.tickerid, "120"), "h2")
   assert.equal(out.plots.h4[i].value, (start + 12 * 3600e3) / 60e3);
   assert.equal(out.plots.h2[i].value, (start + 14 * 3600e3) / 60e3);
 });
+
+test('timeframes named in a request.security script are loaded up front, all at once', async () => {
+  const { prefetchTimeframes } = await import('../src/provider.mjs');
+  const candles = zigzag(100);
+  const calls = [];
+  const loadCandles = (coin, interval, start, end) => { calls.push({ coin, interval, start, end }); return Promise.resolve([]); };
+  const source = `//@version=5
+indicator("t")
+f(tf) => request.security(syminfo.tickerid, tf, close)
+plot(f('5') + f("240") + f('45') + f('60') + f('D'))
+plot(close, "Close")`;
+  const count = prefetchTimeframes({ source, coin: 'BTC', timeframe: '60', candles, loadCandles });
+  // 45m is built from 15m bars; the chart's own 1h and a plot title are not timeframes to load.
+  assert.equal(count, 4);
+  assert.deepEqual(calls.map((c) => c.interval).sort(), ['15m', '1d', '4h', '5m']);
+  assert.ok(calls.every((c) => c.coin === 'BTC' && c.end === candles.at(-1).closeTime && c.start < candles[0].openTime));
+
+  assert.equal(prefetchTimeframes({ source: 'plot(ta.sma(close, 5))', coin: 'BTC', timeframe: '60', candles, loadCandles }), 0);
+});
+
+test('a candle range loading or loaded serves a narrower one without another call', async () => {
+  const { fetchCandleRange } = await import('../src/candles.mjs');
+  const step = 300e3, end = Date.UTC(2026, 1, 1);
+  let calls = 0;
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (_url, init) => {
+    calls++;
+    const { startTime, endTime } = JSON.parse(init.body).req;
+    const rows = [];
+    for (let t = startTime; t <= endTime; t += step) rows.push({ t, T: t + step - 1, o: '1', h: '1', l: '1', c: '1', v: '1' });
+    return new Response(JSON.stringify(rows), { status: 200 });
+  };
+  try {
+    const [wide, narrow] = await Promise.all([
+      fetchCandleRange('TESTCOIN', '5m', end - 1000 * step, end),
+      fetchCandleRange('TESTCOIN', '5m', end - 100 * step, end),
+    ]);
+    assert.equal(calls, 1);
+    assert.equal(wide.length, 1001);
+    assert.equal(narrow.length, 101);
+    assert.equal(narrow[0].openTime, end - 100 * step);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});

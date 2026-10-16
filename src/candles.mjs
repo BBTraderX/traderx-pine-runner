@@ -29,13 +29,29 @@ export async function fetchCandleRange(coin, interval, startTime, endTime) {
   // Rounded to the bar, so runs within the same bar share the cache.
   const end = Math.ceil(endTime / step) * step;
   const start = Math.max(Math.floor(startTime / step) * step, end - MAX_BARS * step);
-  return cached(`${coin}|${interval}|${start}|${end}`, coin, interval, start, end);
+  // A range already loaded (or loading) that covers this one serves it, so a prefetch and the script's own
+  // request share one Hyperliquid call even when the script asks for less.
+  const prefix = `${coin}|${interval}|`;
+  for (const [key, hit] of cache) {
+    if (!key.startsWith(prefix) || Date.now() - hit.at >= CACHE_MS) continue;
+    const [s, e] = key.slice(prefix.length).split('|').map(Number);
+    if (e === end && s <= start && s !== start) return (await hit.candles).filter((c) => c.openTime >= start);
+  }
+  return cached(`${prefix}${start}|${end}`, coin, interval, start, end);
 }
 
-async function cached(key, coin, interval, startTime, endTime) {
+/** Candles from the cache, or loaded once however many callers ask at the same time. */
+function cached(key, coin, interval, startTime, endTime) {
   const hit = cache.get(key);
   if (hit && Date.now() - hit.at < CACHE_MS) return hit.candles;
+  const candles = load(coin, interval, startTime, endTime);
+  cache.set(key, { at: Date.now(), candles });
+  candles.catch(() => cache.get(key)?.candles === candles && cache.delete(key));
+  if (cache.size > 200) cache.delete(cache.keys().next().value);
+  return candles;
+}
 
+async function load(coin, interval, startTime, endTime) {
   let res;
   // Multi-timeframe scripts load several series at once; ride out a brief rate limit (429) rather than fail the run.
   for (let attempt = 0; ; attempt++) {
@@ -52,10 +68,7 @@ async function cached(key, coin, interval, startTime, endTime) {
   const raw = await res.json();
   if (!Array.isArray(raw)) throw new Error('Hyperliquid candles: unexpected response');
 
-  const candles = raw.map((c) => ({
+  return raw.map((c) => ({
     openTime: c.t, closeTime: c.T, open: +c.o, high: +c.h, low: +c.l, close: +c.c, volume: +c.v,
   }));
-  cache.set(key, { at: Date.now(), candles });
-  if (cache.size > 200) cache.delete(cache.keys().next().value);
-  return candles;
 }
