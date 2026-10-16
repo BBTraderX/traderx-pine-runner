@@ -7,9 +7,11 @@
 // candles from this process, so the script itself never needs the network: when request.security wants another
 // timeframe or symbol, the worker asks this process, which loads it from Hyperliquid through one shared cache.
 
+import { createHash } from 'node:crypto';
 import http from 'node:http';
 import { Worker } from 'node:worker_threads';
 import { fetchCandleRange, fetchCandles, MAX_BARS } from './candles.mjs';
+import { conditionsToSignals, hasConditions, validateConditions } from './conditions.mjs';
 import { prefetchTimeframes } from './provider.mjs';
 import { TIMEFRAMES } from './run-script.mjs';
 
@@ -26,8 +28,9 @@ export const SOURCE_URL = process.env.SOURCE_URL ?? 'https://github.com/BBTrader
 
 let running = 0;
 
-export function runInWorker(payload, { timeoutMs = RUN_TIMEOUT_MS, heapMb = HEAP_MB } = {}) {
+export function runInWorker(payload, { timeoutMs = RUN_TIMEOUT_MS, heapMb = HEAP_MB, signal } = {}) {
   return new Promise((resolve) => {
+    if (signal?.aborted) return resolve({ ok: false, userError: true, message: 'Run cancelled.' });
     const worker = new Worker(new URL('./worker.mjs', import.meta.url), {
       workerData: payload,
       resourceLimits: { maxOldGenerationSizeMb: heapMb, maxYoungGenerationSizeMb: 32 },
@@ -37,9 +40,13 @@ export function runInWorker(payload, { timeoutMs = RUN_TIMEOUT_MS, heapMb = HEAP
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      signal?.removeEventListener('abort', cancel);
       resolve(value);
       worker.terminate();
     };
+    // The caller went away (the page started a newer run): stop now and free the slot.
+    const cancel = () => done({ ok: false, userError: true, message: 'Run cancelled.' });
+    signal?.addEventListener('abort', cancel);
     const timer = setTimeout(
       () => done({ ok: false, userError: true, message: `Script took longer than ${timeoutMs / 1000}s and was stopped.` }),
       timeoutMs,
@@ -79,7 +86,35 @@ async function readJson(req) {
   }
 }
 
-export async function handleRun(body, { search = false } = {}) {
+/** Recent runs by script, settings and candles. Small: a result holds every plot's values for every bar. */
+const results = new Map();
+const MAX_RESULTS = 20;
+
+/** Null when the run's candles came with the request: those aren't worth keying on. */
+function resultKey(source, coin, interval, inputs, series) {
+  if (typeof coin !== 'string' || !series.length) return null;
+  const last = series.at(-1);
+  // A new or updated last bar is a new key, so a remembered run never outlives the candles it ran on.
+  const candles = [series.length, series[0].openTime, last.openTime, last.close, last.volume];
+  return createHash('sha256').update(JSON.stringify([source, coin.trim(), interval, inputs ?? {}, candles])).digest('hex');
+}
+
+function remember(key, entry) {
+  results.delete(key);
+  results.set(key, entry);
+  if (results.size > MAX_RESULTS) results.delete(results.keys().next().value);
+}
+
+/** A remembered run with other conditions applied: what running it again with them would return. */
+function withConditions({ result, candles }, conditions) {
+  if (hasConditions(conditions)) {
+    return { ...result, signals: conditionsToSignals(conditions, result.plots, result.events, candles), signalSource: 'conditions' };
+  }
+  const strategy = result.strategy;
+  return { ...result, signals: strategy ? strategy.signals : [], signalSource: strategy ? 'strategy' : 'none' };
+}
+
+export async function handleRun(body, { search = false, signal } = {}) {
   const { source, coin, interval, bars, candles, inputs, conditions } = body ?? {};
   if (typeof source !== 'string' || !source.trim()) return [400, { error: 'source is required.' }];
   if (Buffer.byteLength(source) > MAX_SOURCE_BYTES) return [400, { error: 'Script is too long.' }];
@@ -98,21 +133,53 @@ export async function handleRun(body, { search = false } = {}) {
     return [400, { error: `candles must be an array of at most ${MAX_BARS}.` }];
   }
 
-  if (running >= MAX_CONCURRENT) return [429, { error: 'Runner is busy, try again shortly.' }];
-  running++;
+  // The same script, settings and candles ran a moment ago: only the conditions changed, and those are applied after
+  // the script, so answer from that run. A heavy multi-timeframe script takes most of a minute on the host; a rule
+  // change shouldn't.
+  const key = search ? null : resultKey(source, coin, interval, inputs, series);
+  const prior = key && results.get(key);
+  if (prior) {
+    try {
+      validateConditions(conditions ?? null);
+    } catch (err) {
+      return [422, { error: err.message }];
+    }
+    return [200, withConditions(prior, conditions ?? null)];
+  }
+
+  if (!(await takeSlot(signal))) return [429, { error: 'Runner is busy, try again shortly.' }];
   try {
     if (typeof coin === 'string' && coin.trim()) {
       prefetchTimeframes({ source, coin: coin.trim(), timeframe: TIMEFRAMES[interval], candles: series });
     }
     const payload = { source, candles: series, interval, symbol: coin ?? 'COIN', inputs: inputs ?? {}, conditions: conditions ?? null };
     const out = search
-      ? await runInWorker({ ...payload, mode: 'search', searchDeadlineMs: SEARCH_TIMEOUT_MS - 15_000 }, { timeoutMs: SEARCH_TIMEOUT_MS })
-      : await runInWorker(payload);
+      ? await runInWorker({ ...payload, mode: 'search', searchDeadlineMs: SEARCH_TIMEOUT_MS - 15_000 }, { timeoutMs: SEARCH_TIMEOUT_MS, signal })
+      : await runInWorker(payload, { signal });
+    if (out.ok && key) remember(key, { result: out.result, candles: series });
     if (out.ok) return [200, out.result];
     return out.userError ? [422, { error: out.message }] : [500, { error: 'Script run failed.' }];
   } finally {
     running--;
+    waiting.shift()?.();
   }
+}
+
+/** Wait briefly for a free slot rather than refuse at once; false when none frees up or the caller leaves. */
+const waiting = [];
+const SLOT_WAIT_MS = 15_000;
+async function takeSlot(signal) {
+  const deadline = Date.now() + SLOT_WAIT_MS;
+  while (running >= MAX_CONCURRENT) {
+    if (signal?.aborted || Date.now() >= deadline || waiting.length >= 20) return false;
+    await new Promise((resolve) => {
+      const wake = () => { clearTimeout(t); resolve(); };
+      const t = setTimeout(() => { const i = waiting.indexOf(wake); if (i >= 0) waiting.splice(i, 1); resolve(); }, deadline - Date.now());
+      waiting.push(wake);
+    });
+  }
+  running++;
+  return true;
 }
 
 export function createServer() {
@@ -122,7 +189,11 @@ export function createServer() {
       const isSearch = req.url === '/v1/search';
       if (req.method !== 'POST' || (req.url !== '/v1/run' && !isSearch)) return send(res, 404, { error: 'Not found.' });
       if (TOKEN && req.headers.authorization !== `Bearer ${TOKEN}`) return send(res, 401, { error: 'Unauthorized.' });
-      const [status, body] = await handleRun(await readJson(req), { search: isSearch });
+      // Closed before we answered: the caller no longer wants this run.
+      const gone = new AbortController();
+      res.once('close', () => { if (!res.writableFinished) gone.abort(); });
+      const [status, body] = await handleRun(await readJson(req), { search: isSearch, signal: gone.signal });
+      if (gone.signal.aborted) return;
       return send(res, status, body);
     } catch (err) {
       return send(res, err.status ?? 500, { error: err.status ? err.message : 'Internal error.' });

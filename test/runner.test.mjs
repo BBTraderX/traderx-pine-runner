@@ -406,3 +406,51 @@ test('a candle range loading or loaded serves a narrower one without another cal
     globalThis.fetch = realFetch;
   }
 });
+
+test('a conditions-only change is answered from the last run, the same as running again', async () => {
+  const candles = zigzag();
+  const longOnly = { 'entry-long': [{ left: 'plot:Fast', op: 'crosses_above', right: { series: 'plot:Slow' } }] };
+  const both = {
+    ...longOnly,
+    'entry-short': [{ left: 'plot:Fast', op: 'crosses_below', right: { series: 'plot:Slow' } }],
+  };
+  const body = (conditions) => ({ source: EMA_INDICATOR, coin: 'CACHETEST', candles, interval: '1h', conditions });
+
+  const [s1] = await handleRun(body(longOnly));
+  assert.equal(s1, 200);
+  const t = Date.now();
+  const [s2, cached] = await handleRun(body(both));
+  assert.equal(s2, 200);
+  assert.ok(Date.now() - t < 200, 'answered without starting a worker');
+  const fresh = await runScript({ source: EMA_INDICATOR, candles, interval: '1h', conditions: both });
+  assert.deepEqual(cached.signals, fresh.signals);
+  assert.equal(cached.signalSource, 'conditions');
+
+  const [s3, none] = await handleRun(body(null));
+  assert.equal(s3, 200);
+  assert.equal(none.signalSource, 'none');
+  assert.deepEqual(none.signals, []);
+
+  const [s4, bad] = await handleRun(body({ 'entry-long': [{ left: 'plot:Fast', op: 'nope' }] }));
+  assert.equal(s4, 422);
+  assert.ok(bad.error);
+});
+
+test('a run whose caller leaves is stopped at once, freeing its slot', async () => {
+  const src = `//@version=5
+indicator("Spin")
+var x = 0.0
+for i = 0 to 3000
+    for j = 0 to 3000
+        x += 1
+plot(x)
+`;
+  const gone = new AbortController();
+  const t = Date.now();
+  const pending = handleRun({ source: src, candles: zigzag(50), interval: '1h' }, { signal: gone.signal });
+  setTimeout(() => gone.abort(), 300);
+  const [status, body] = await pending;
+  assert.equal(status, 422);
+  assert.equal(body.error, 'Run cancelled.');
+  assert.ok(Date.now() - t < 5000);
+});
