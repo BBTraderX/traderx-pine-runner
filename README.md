@@ -77,7 +77,14 @@ Or `docker build -t traderx-pine-runner .` and run it with `RUNNER_TOKEN` set.
 
 ## PineTS
 
-The runner uses PineTS 0.11.0 with one fix, built from source and vendored in `vendor/`: `request.security` inside a user function that is called from several places (one call per timeframe, say) failed with "Cannot read properties of undefined", because the slice PineTS runs for the other timeframe only reached the function's first call. The change is `vendor/pinets-0.11.0-traderx.1.patch`, against [LuxAlgo/PineTS](https://github.com/LuxAlgo/PineTS) at `v0.11.0`; to rebuild, apply it there, `npm ci && npm run build:prod:all`, set the version to `0.11.0-traderx.1` and `npm pack`.
+The runner uses PineTS 0.11.0 with these changes, built from source and vendored in `vendor/`:
+
+- `request.security` inside a user function called from several places (one call per timeframe, say) failed with "Cannot read properties of undefined": the slice PineTS runs for the other timeframe only reached the function's first call. There is now one slice per call site.
+- The other timeframe ran with the script's default settings, whatever the user set: an input override never reached `request.security`. It now gets the run's settings.
+- A slice ran everything before its call, so each timeframe also recomputed the rest of the script (and every earlier call of the same function). Slices are now pruned to the statements the call depends on; anything the analysis can't follow is left unpruned.
+- `PineTS.securityCache`: the runner keeps each timeframe's result (bar times and values) in the server process for five minutes, with the settings that timeframe actually read. A run that changes only other settings (a display option, a threshold) reuses it instead of recomputing every timeframe.
+
+The changes are `vendor/pinets-0.11.0-traderx.2.patch`, against [LuxAlgo/PineTS](https://github.com/LuxAlgo/PineTS) at `v0.11.0`; to rebuild, apply it there, `npm ci && npm run build:prod:all`, set the version to `0.11.0-traderx.2` and `npm pack`.
 
 ## License
 

@@ -10,7 +10,7 @@
   "license": "AGPL-3.0-only",
   "type": "module",
   "dependencies": {
-    "pinets": "file:vendor/pinets-0.11.0-traderx.1.tgz"
+    "pinets": "file:vendor/pinets-0.11.0-traderx.2.tgz"
   },
   "engines": {
     "node": ">=22"

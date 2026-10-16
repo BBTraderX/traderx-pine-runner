@@ -298,7 +298,7 @@ test('the search endpoint answers with results and refuses a broken script', asy
 });
 
 // Candles whose close is their close time in minutes, so any timeframe's close is easy to check.
-const STEP = { '1h': 3600e3, '2h': 7200e3, '4h': 14400e3 };
+const STEP = { '1h': 3600e3, '2h': 7200e3, '4h': 14400e3, '1d': 86400e3 };
 function clock(interval, startTime, endTime) {
   const step = STEP[interval];
   const out = [];
@@ -453,4 +453,42 @@ plot(x)
   assert.equal(status, 422);
   assert.equal(body.error, 'Run cancelled.');
   assert.ok(Date.now() - t < 5000);
+});
+
+test('settings reach other timeframes, and a timeframe is reused while the settings it reads are unchanged', async () => {
+  const start = Date.UTC(2026, 0, 1);
+  const candles = clock('1h', start, start + 300 * 3600e3);
+  let loads = 0;
+  const loadCandles = async (_coin, interval, s, e) => { loads++; return clock(interval, s, e); };
+  const source = `//@version=5
+indicator("MTF settings")
+len = input.int(2, "Len")
+dots = input.string("small", "Dot Size")
+f(tf) => request.security(syminfo.tickerid, tf, ta.sma(close, len))
+plot(f("240"), "h4")
+plot(f("D"), "d")
+plot(dots == "small" ? 1 : 2, "dots")
+`;
+  const entries = new Map();
+  let stored = 0;
+  const securityCache = {
+    get: async (parts) => entries.get(JSON.stringify(parts)),
+    set: async (parts, entry) => { stored++; entries.set(JSON.stringify(parts), [entry, ...(entries.get(JSON.stringify(parts)) ?? [])]); },
+  };
+  const run = (inputs, cache = securityCache) => runScript({ source, candles, interval: '1h', symbol: 'BTC', inputs, loadCandles, securityCache: cache });
+
+  const first = await run({});
+  assert.equal(stored, 2);
+  // Dot Size isn't read by either timeframe: both reused, nothing loaded, same values as a fresh run.
+  loads = 0;
+  const dots = await run({ 'Dot Size': 'large' });
+  assert.equal(stored, 2);
+  assert.equal(loads, 0);
+  assert.deepEqual(dots.plots, (await run({ 'Dot Size': 'large' }, null)).plots);
+  assert.deepEqual(dots.plots.h4, first.plots.h4);
+  // Len is: both timeframes run again, and the new length reaches them.
+  const longer = await run({ Len: 5 });
+  assert.equal(stored, 4);
+  assert.deepEqual(longer.plots, (await run({ Len: 5 }, null)).plots);
+  assert.notDeepEqual(longer.plots.h4, first.plots.h4);
 });

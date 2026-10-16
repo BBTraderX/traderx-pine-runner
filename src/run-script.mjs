@@ -36,7 +36,7 @@ const DRAWING_KEYS = new Set(['__labels__', '__lines__', '__boxes__', '__linefil
  * @param {Function} [req.loadCandles] (coin, interval, startTime, endTime) → candles, for request.security. The worker
  *   passes one that asks the parent process; without it, candles are fetched from Hyperliquid directly.
  */
-export async function runScript({ source, candles, interval, symbol = 'COIN', inputs = {}, conditions = null, loadCandles }) {
+export async function runScript({ source, candles, interval, symbol = 'COIN', inputs = {}, conditions = null, loadCandles, securityCache }) {
   const timeframe = TIMEFRAMES[interval];
   if (!timeframe) throw new UserError(`Unsupported interval "${interval}".`);
   if (!Array.isArray(candles) || candles.length === 0) throw new UserError('No candles to run on.');
@@ -51,6 +51,8 @@ export async function runScript({ source, candles, interval, symbol = 'COIN', in
 
   // A provider rather than the bare candles, so request.security can load other timeframes and symbols.
   const pine = new PineTS(createProvider({ coin: symbol, timeframe, candles, loadCandles }), symbol, timeframe);
+  // Other timeframes' results, kept between runs while the settings they depend on are unchanged.
+  if (securityCache) pine.securityCache = securityCache;
   // Backtests need every historical alert, not only those on a live bar (TradingView's default).
   pine.setAlertMode('all');
   const ctx = await pine.run(indicator);

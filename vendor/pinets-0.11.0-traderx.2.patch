@@ -1,0 +1,890 @@
+diff --git a/src/PineTS.class.ts b/src/PineTS.class.ts
+index a00ee40..4fa50e4 100644
+--- a/src/PineTS.class.ts
++++ b/src/PineTS.class.ts
+@@ -63,6 +63,19 @@ export class PineTS {
+     // _initializeContext to surface the original pineTSCode on the Context.
+     private _currentIndicator: Indicator | null = null;
+ 
++    /**
++     * Where request.security may keep a secondary's result between runs: `get(parts)` resolves to an entry stored by
++     * `set(parts, entry)` or undefined. Both may be async (the store can live in another thread). Unset, nothing is
++     * kept.
++     */
++    public securityCache?: {
++        get(parts: any): any | Promise<any>;
++        set(parts: any, entry: any): void | Promise<void>;
++    };
++
++    /** Record the inputs a run reads (context._inputReads), so its result can be reused while they keep their values. */
++    public _trackInputReads: boolean = false;
++
+     private _isSecondaryContext: boolean = false;
+     public markAsSecondary() {
+         this._isSecondaryContext = true;
+@@ -1113,6 +1126,8 @@ export class PineTS {
+ 
+         context.pineTSCode = pineTSCode;
+         context.isSecondaryContext = isSecondary; // Set secondary context flag
++        (context as any).securityCache = this.securityCache;
++        if (this._trackInputReads) (context as any)._inputReads = new Map();
+         context.data.close = new Series([]);
+         context.data.open = new Series([]);
+         context.data.high = new Series([]);
+diff --git a/src/namespaces/input/utils.ts b/src/namespaces/input/utils.ts
+index 0c012fe..7e43f5b 100644
+--- a/src/namespaces/input/utils.ts
++++ b/src/namespaces/input/utils.ts
+@@ -72,7 +72,53 @@ export function parseInputOptions(args: any[]): Partial<InputOptions> {
+     return options;
+ }
+ 
++/** An input's identities, as resolveInput tries them. */
++export interface InputIdentity {
++    inputId?: string;
++    varId?: string;
++    title?: string;
++}
++
++/**
++ * The override `inputs` holds for an input, or `{ set: false }` when it has none (the input takes its default). Same
++ * order as resolveInput.
++ */
++export function inputOverride(inputs: Record<string, any> | undefined, id: InputIdentity): { set: boolean; value?: any } {
++    if (inputs) {
++        if (id.inputId && inputs[id.inputId] !== undefined) return { set: true, value: inputs[id.inputId] };
++        if (id.varId && inputs[id.varId] !== undefined) return { set: true, value: inputs[id.varId] };
++        if (id.title && inputs[id.title] !== undefined) return { set: true, value: inputs[id.title] };
++    }
++    return { set: false };
++}
++
++/** A plain default (number, string, bool) that an override can be compared with; undefined for anything else. */
++function plainDefault(defval: any): string | number | boolean | undefined {
++    return typeof defval === 'number' || typeof defval === 'string' || typeof defval === 'boolean' ? defval : undefined;
++}
++
++/**
++ * What an input is set to, comparable across runs: an override equal to the input's plain default counts as no
++ * override, so `{}` and `{ Len: 4 }` for `input.int(4, "Len")` are the same setting.
++ */
++export function inputSetting(inputs: Record<string, any> | undefined, id: InputIdentity, defval: any): string {
++    const o = inputOverride(inputs, id);
++    const plain = plainDefault(defval);
++    if (!o.set || (plain !== undefined && o.value === plain)) return 'default';
++    return JSON.stringify(o.value) ?? 'undefined';
++}
++
+ export function resolveInput(context: any, options: Partial<InputOptions>) {
++    // A context that records the inputs it reads (a request.security secondary whose result may be reused while
++    // those inputs keep their values): note this one and its setting.
++    if (context?._inputReads) {
++        const id: InputIdentity = { inputId: options.__inputId, varId: options.__varId, title: options.title };
++        const key = `${id.inputId ?? ''}|${id.varId ?? ''}|${id.title ?? ''}`;
++        if (!context._inputReads.has(key)) {
++            const defval = plainDefault(options.defval);
++            context._inputReads.set(key, { id, defval, setting: inputSetting(context.inputs, id, defval) });
++        }
++    }
+     // Override resolution, PRIMARY → fallback:
+     //   0. by inputId — `in_N`, unique per declared input of a Pine script
+     //   1. by varId   — the variable name; robust to empty/duplicate titles
+diff --git a/src/namespaces/request/methods/security.ts b/src/namespaces/request/methods/security.ts
+index b3e81e6..cbe040e 100644
+--- a/src/namespaces/request/methods/security.ts
++++ b/src/namespaces/request/methods/security.ts
+@@ -1,6 +1,8 @@
+ // SPDX-License-Identifier: AGPL-3.0-only
+ 
+ import { PineTS } from '../../../PineTS.class';
++import { Indicator } from '../../../Indicator';
++import { inputSetting } from '../../input/utils';
+ import { Series } from '../../../Series';
+ import { plainTickerId, splitTickerModifier, withTickerModifier } from '../../../tickerModifier';
+ import { formatTimeframe, parseTimeframe, timeframeSeconds } from '../../../timeframe';
+@@ -225,8 +227,10 @@ export function security(context: any) {
+         if (context.cache[cacheKey]) {
+             const cached = context.cache[cacheKey];
+ 
+-            // Refresh secondary context when main context's data has changed (streaming mode)
+-            if (context.dataVersion > cached.dataVersion) {
++            // Refresh secondary context when main context's data has changed (streaming mode).
++            // A result reused from securityCache has no PineTS to refresh; hosts that stream
++            // don't set one.
++            if (context.dataVersion > cached.dataVersion && cached.pineTS) {
+                 await cached.pineTS.updateTail(cached.context);
+                 cached.dataVersion = context.dataVersion;
+             }
+@@ -311,13 +315,6 @@ export function security(context: any) {
+             : 0;
+         const secEDate = lastBarCloseTime || context.eDate || Date.now();
+ 
+-        // Pass calc_bars_count as `periods` so the secondary fetches that many bars
+-        // ending at secEDate — gives the script the historical depth it asked for.
+-        const pineTS = new PineTS(context.source, _symbol, _timeframe, _calc_bars_count, adjustedSDate, secEDate);
+-
+-        // Mark as secondary context to prevent infinite recursion
+-        pineTS.markAsSecondary();
+-
+         // Truncated-slice slow path (Phase 4): when the transpiler emitted
+         // a slice for THIS call's expression name, the secondary runs the
+         // prefix-of-statements ending at the call instead of the full
+@@ -328,10 +325,79 @@ export function security(context: any) {
+         // available.
+         const exprNameStr = typeof _expression_name === 'string' ? _expression_name : '';
+         const sliceKey = exprNameStr.match(/p\d+$/)?.[0] ?? exprNameStr;
+-        const slice = (context as any)._ltfTruncatedBodies?.[sliceKey];
+-        const secContext = slice
+-            ? await pineTS.runPretranspiled(slice)
+-            : await pineTS.run(context.pineTSCode);
++        // A function called from several places has one slice per call site,
++        // keyed by the full `<callsiteId>pN` name; prefer it over the bare `pN`
++        // slice, which only reaches the function's first call.
++        const bodies = (context as any)._ltfTruncatedBodies;
++        const slice = bodies?.[exprNameStr] ?? bodies?.[sliceKey];
++
++        // The secondary runs with the chart's input overrides: a setting has to reach
++        // every timeframe the script reads, not only the chart's.
++        const inputs = context.inputs ?? {};
++
++        // A host may keep secondaries' results between runs (context.securityCache).
++        // An entry is reused while every input its run read still has the value it had;
++        // with the slice pruned to what the expression depends on, those are only the
++        // inputs that can change it.
++        const store = (context as any).securityCache;
++        const storeParts = store
++            ? {
++                  source: String(context.pineTSCode ?? ''),
++                  symbol: _symbol,
++                  timeframe: _timeframe,
++                  expression: exprNameStr,
++                  sDate: adjustedSDate ?? null,
++                  eDate: secEDate,
++                  bars: _calc_bars_count ?? null,
++              }
++            : null;
++
++        let pineTS: PineTS | null = null;
++        let secContext: any = null;
++        if (store) {
++            const entries = await store.get(storeParts);
++            const hit = (Array.isArray(entries) ? entries : []).find((e: any) =>
++                e.reads.every((r: any) => inputSetting(inputs, r.id, r.defval) === r.setting)
++            );
++            if (hit) {
++                // Only what this function reads from a secondary: its bar times and the expression's values.
++                secContext = {
++                    data: { openTime: { data: hit.openTime }, closeTime: { data: hit.closeTime } },
++                    params: { [_expression_name]: hit.values },
++                };
++            }
++        }
++
++        if (!secContext) {
++            // Pass calc_bars_count as `periods` so the secondary fetches that many bars
++            // ending at secEDate — gives the script the historical depth it asked for.
++            pineTS = new PineTS(context.source, _symbol, _timeframe, _calc_bars_count, adjustedSDate, secEDate);
++
++            // Mark as secondary context to prevent infinite recursion
++            pineTS.markAsSecondary();
++            if (store) pineTS._trackInputReads = true;
++
++            secContext = slice
++                ? await pineTS.runPretranspiled(slice, inputs)
++                : await pineTS.run(new Indicator(context.pineTSCode, inputs));
++            // A slice that never reached this call site: run the full script instead.
++            if (slice && secContext.params?.[_expression_name] === undefined) {
++                secContext = await pineTS.run(new Indicator(context.pineTSCode, inputs));
++            }
++
++            if (store && secContext.params?.[_expression_name] !== undefined) {
++                try {
++                    await store.set(storeParts, {
++                        reads: [...(secContext._inputReads?.values() ?? [])],
++                        openTime: [...secContext.data.openTime.data],
++                        closeTime: [...secContext.data.closeTime.data],
++                        values: secContext.params[_expression_name],
++                    });
++                } catch {
++                    // A value the store can't keep (not serializable): this run still has it.
++                }
++            }
++        }
+ 
+         context.cache[cacheKey] = { pineTS, context: secContext, dataVersion: context.dataVersion };
+ 
+diff --git a/src/namespaces/request/methods/security_lower_tf.ts b/src/namespaces/request/methods/security_lower_tf.ts
+index 6bfec6e..7f5c165 100644
+--- a/src/namespaces/request/methods/security_lower_tf.ts
++++ b/src/namespaces/request/methods/security_lower_tf.ts
+@@ -1,6 +1,7 @@
+ // SPDX-License-Identifier: AGPL-3.0-only
+ 
+ import { PineTS } from '../../../PineTS.class';
++import { Indicator } from '../../../Indicator';
+ import { Series } from '../../../Series';
+ import { formatTimeframe, parseTimeframe, timeframeSeconds } from '../../../timeframe';
+ import { plainTickerId } from '../../../tickerModifier';
+@@ -415,12 +416,20 @@ export function security_lower_tf(context: any) {
+                 // the trailing `pN` for the lookup.
+                 const exprNameStr = typeof _expression_name === 'string' ? _expression_name : '';
+                 const sliceKey = exprNameStr.match(/p\d+$/)?.[0] ?? exprNameStr;
+-                const slice = (context as any)._ltfTruncatedBodies?.[sliceKey];
++                // Prefer the per-call-site slice (`<callsiteId>pN`) of a function
++                // called from several places; the bare `pN` slice only reaches
++                // its first call.
++                const bodies = (context as any)._ltfTruncatedBodies;
++                const slice = bodies?.[exprNameStr] ?? bodies?.[sliceKey];
+                 let secContext: any;
+                 if (slice) {
+-                    secContext = await pineTS.runPretranspiled(slice);
++                    secContext = await pineTS.runPretranspiled(slice, context.inputs ?? {});
++                    // A slice that never reached this call site: run the full script instead.
++                    if (secContext.params?.[_expression_name] === undefined) {
++                        secContext = await pineTS.run(new Indicator(context.pineTSCode, context.inputs ?? {}));
++                    }
+                 } else {
+-                    secContext = await pineTS.run(context.pineTSCode);
++                    secContext = await pineTS.run(new Indicator(context.pineTSCode, context.inputs ?? {}));
+                 }
+                 context.cache[cacheKey] = { pineTS, context: secContext, dataVersion: context.dataVersion };
+             }
+diff --git a/src/transpiler/slicing/buildLtfSlices.ts b/src/transpiler/slicing/buildLtfSlices.ts
+index d2c4d5d..dd35d70 100644
+--- a/src/transpiler/slicing/buildLtfSlices.ts
++++ b/src/transpiler/slicing/buildLtfSlices.ts
+@@ -211,6 +211,37 @@ function findEarliestInvocationIdx(wrapperBody: any, fnName: string, fnDeclNode:
+     return -1;
+ }
+ 
++/**
++ * Every `$.call(<fnName>, "<callsiteId>", …)` in a top-level statement,
++ * with the index of that statement. The callsite id is what `$.call`
++ * pushes onto the call stack, so for a top-level invocation it is the
++ * whole runtime `$$.id` inside the function.
++ */
++function findTopLevelInvocations(wrapperBody: any, fnName: string, fnDeclNode: any): Array<{ callsiteId: string; stmtIdx: number }> {
++    const found: Array<{ callsiteId: string; stmtIdx: number }> = [];
++    const stmts: any[] = wrapperBody.body || [];
++    for (let i = 0; i < stmts.length; i++) {
++        if (stmts[i] === fnDeclNode) continue;
++        const seen = new WeakSet<object>();
++        const walk = (n: any) => {
++            if (!n || typeof n !== 'object' || seen.has(n)) return;
++            seen.add(n);
++            if (dollarCallTarget(n) === fnName) {
++                const id = n.arguments?.[1];
++                if (id?.type === 'Literal' && typeof id.value === 'string') found.push({ callsiteId: id.value, stmtIdx: i });
++            }
++            for (const key of Object.keys(n)) {
++                if (AST_SKIP_KEYS.has(key)) continue;
++                const v = n[key];
++                if (Array.isArray(v)) v.forEach(walk);
++                else if (v && typeof v === 'object') walk(v);
++            }
++        };
++        walk(stmts[i]);
++    }
++    return found;
++}
++
+ function subtreeContainsDollarCall(root: any, fnName: string): boolean {
+     let found = false;
+     const seen = new WeakSet<object>();
+@@ -258,7 +289,7 @@ function subtreeContainsDollarCall(root: any, fnName: string): boolean {
+  * truncate, etc.). Falling back is always safe — the runtime uses
+  * the legacy full-script slow path when no slice is registered.
+  */
+-function buildPhase3SliceStmts(wrapperBody: any, path: any[]): any[] | null {
++function buildPhase3SliceStmts(wrapperBody: any, path: any[], atInvocationIdx?: number): any[] | null {
+     // path[0] === wrapperBody. Find the FIRST FunctionDeclaration
+     // on the path — that's the outer-most fn body the call lives in.
+     let fnIdx = -1;
+@@ -284,7 +315,7 @@ function buildPhase3SliceStmts(wrapperBody: any, path: any[]): any[] | null {
+     const slicedFn = sliceAlongPath(fnNode, fnSlicePath, 0);
+ 
+     // Find the earliest top-level invocation of this function.
+-    const invIdx = findEarliestInvocationIdx(wrapperBody, fnName, fnNode);
++    const invIdx = atInvocationIdx ?? findEarliestInvocationIdx(wrapperBody, fnName, fnNode);
+     if (invIdx < 0) return null;
+ 
+     // Build the wrapper.body slice: keep [0..invIdx] inclusive, with
+@@ -304,6 +335,286 @@ function buildPhase3SliceStmts(wrapperBody: any, path: any[]): any[] | null {
+     return result;
+ }
+ 
++// ── Dependency pruning ───────────────────────────────────────────────
++//
++// A slice keeps every statement on the path to its call, so a secondary
++// also recomputes everything else the script does before it: other
++// plots, chart-only lines and, for a function called once per timeframe,
++// every earlier invocation of that function. None of it can change the
++// requested expression unless the expression depends on it. Pruning keeps
++// only the statements the final one transitively depends on.
++//
++// The analysis is conservative: a statement that might change something
++// (a call outside the known-pure namespaces, a field assignment) counts as
++// writing everything it touches, every function declaration is kept, and
++// anything it does not understand leaves the slice unpruned.
++
++/** Namespaces whose calls never change their arguments. */
++const PURE_NAMESPACES = new Set([
++    'ta', 'math', 'input', 'color', 'str', 'request', 'timeframe', 'syminfo', 'ticker', 'plot', 'session',
++    'barstate', 'time', 'na', 'nz', 'fixnan', 'shape', 'location', 'size', 'position', 'format', 'display',
++    'barmerge', 'currency', 'dayofweek', 'extend', 'hline', 'order', 'scale', 'xloc', 'yloc', 'font', 'text',
++]);
++/** `$.<method>` calls that write their first argument; every other `$.` helper only reads. */
++const DOLLAR_WRITERS = new Set(['set', 'init', 'initVar']);
++
++class PruneUnsupported extends Error {}
++
++/** Namespaces whose calls change their arguments (array.push(a, x)); the namespace object itself never changes. */
++const MUTATING_NAMESPACES = new Set([
++    'array', 'map', 'matrix', 'table', 'label', 'line', 'box', 'linefill', 'polyline', 'strategy', 'log', 'runtime',
++    'chart', 'alert',
++]);
++/** The runtime's own handles: in every statement, never a dependency. */
++const RUNTIME_IDS = new Set(['$', '$$', 'undefined']);
++
++/** `$.let.x` / `$.var.x` / `$.const.x` → `g:let.x`; an Identifier → `id:x`; anything else null. */
++function varName(node: any): string | null {
++    if (!node) return null;
++    if (node.type === 'Identifier') return RUNTIME_IDS.has(node.name) ? '' : 'id:' + node.name;
++    if (
++        node.type === 'MemberExpression' &&
++        node.object?.type === 'MemberExpression' &&
++        node.object.object?.type === 'Identifier' &&
++        node.object.object.name === '$' &&
++        !node.object.computed &&
++        node.object.property?.type === 'Identifier' &&
++        ['let', 'var', 'const'].includes(node.object.property.name)
++    ) {
++        if (node.computed || node.property?.type !== 'Identifier') throw new PruneUnsupported('computed variable access');
++        return 'g:' + node.object.property.name + '.' + node.property.name;
++    }
++    return null;
++}
++
++/** Every variable name read anywhere in `node`. */
++function namesIn(node: any, out: Set<string> = new Set()): Set<string> {
++    const seen = new WeakSet<object>();
++    const walk = (n: any) => {
++        if (!n || typeof n !== 'object' || seen.has(n)) return;
++        seen.add(n);
++        if (n.type === 'ThisExpression') throw new PruneUnsupported('this');
++        if (n.type === 'Identifier' && (n.name === 'eval' || n.name === 'arguments')) throw new PruneUnsupported(n.name);
++        // `$.let` / `$.var` / `$.const` handed around whole.
++        if (
++            n.type === 'MemberExpression' &&
++            n.object?.type === 'Identifier' && n.object.name === '$' &&
++            n.property?.type === 'Identifier' && ['let', 'var', 'const'].includes(n.property.name)
++        ) {
++            throw new PruneUnsupported('variable store used whole');
++        }
++        const name = varName(n);
++        if (name !== null) {
++            if (name) out.add(name);
++            return;
++        }
++        // A member's property name is not a variable.
++        if (n.type === 'MemberExpression' && !n.computed) {
++            walk(n.object);
++            return;
++        }
++        if (n.type === 'Property' && !n.computed) {
++            walk(n.value);
++            return;
++        }
++        for (const key of Object.keys(n)) {
++            if (AST_SKIP_KEYS.has(key)) continue;
++            const v = n[key];
++            if (Array.isArray(v)) v.forEach(walk);
++            else if (v && typeof v === 'object') walk(v);
++        }
++    };
++    walk(node);
++    return out;
++}
++
++interface Effects {
++    reads: Set<string>;
++    writes: Set<string>;
++    /** User functions it calls through `$.call`. */
++    calls: Set<string>;
++    /** Calls something that may change its arguments. */
++    mutates: boolean;
++}
++
++/** What a statement (or function body) reads, writes and calls. */
++function effectsOf(root: any): Effects {
++    const fx: Effects = { reads: namesIn(root), writes: new Set(), calls: new Set(), mutates: false };
++    const seen = new WeakSet<object>();
++    const writeAll = (n: any) => namesIn(n, fx.writes);
++    const walk = (n: any) => {
++        if (!n || typeof n !== 'object' || seen.has(n)) return;
++        seen.add(n);
++        switch (n.type) {
++            case 'VariableDeclarator':
++                if (n.id?.type === 'Identifier') fx.writes.add('id:' + n.id.name);
++                else writeAll(n.id);
++                break;
++            case 'AssignmentExpression': {
++                const name = varName(n.left);
++                if (name !== null) {
++                    if (name) fx.writes.add(name);
++                }
++                else {
++                    // A field of something (UDT field, array element): that something changes.
++                    writeAll(n.left);
++                    fx.mutates = true;
++                }
++                break;
++            }
++            case 'UpdateExpression':
++                writeAll(n.argument);
++                fx.mutates = true;
++                break;
++            case 'CallExpression': {
++                const callee = n.callee;
++                const target = dollarCallTarget(n);
++                if (target) {
++                    fx.calls.add(target);
++                } else if (
++                    callee?.type === 'MemberExpression' && !callee.computed &&
++                    callee.object?.type === 'Identifier' && callee.object.name === '$'
++                ) {
++                    if (DOLLAR_WRITERS.has(callee.property?.name)) {
++                        const name = varName(n.arguments?.[0]);
++                        if (name) fx.writes.add(name);
++                        else if (name === null) writeAll(n.arguments?.[0]);
++                    }
++                } else if (callee?.type === 'Identifier') {
++                    // Bare builtins (plot, plotshape, bgcolor, alertcondition, nz…) only read.
++                } else if (
++                    callee?.type === 'MemberExpression' && !callee.computed &&
++                    callee.object?.type === 'Identifier' && PURE_NAMESPACES.has(callee.object.name)
++                ) {
++                    // ta.ema(…), math.max(…), input.int(…): read only.
++                } else if (
++                    callee?.type === 'MemberExpression' && !callee.computed &&
++                    callee.object?.type === 'MemberExpression' &&
++                    callee.object.object?.type === 'MemberExpression' &&
++                    callee.object.object.object?.type === 'Identifier' && callee.object.object.object.name === '$' &&
++                    callee.object.object.property?.name === 'pine' &&
++                    PURE_NAMESPACES.has(callee.object.property?.name)
++                ) {
++                    // $.pine.math.__gt(…) and friends.
++                } else {
++                    // array.push(a, x), obj.method(…), anything else: may change what it is given.
++                    fx.mutates = true;
++                    for (const a of n.arguments ?? []) writeAll(a);
++                    const nsCall =
++                        callee?.type === 'MemberExpression' && callee.object?.type === 'Identifier' &&
++                        MUTATING_NAMESPACES.has(callee.object.name);
++                    if (callee?.type === 'MemberExpression' && !nsCall) writeAll(callee.object);
++                }
++                break;
++            }
++        }
++        for (const key of Object.keys(n)) {
++            if (AST_SKIP_KEYS.has(key)) continue;
++            const v = n[key];
++            if (Array.isArray(v)) v.forEach(walk);
++            else if (v && typeof v === 'object') walk(v);
++        }
++    };
++    walk(root);
++    return fx;
++}
++
++/** Names a function declares for itself: its parameters, and every variable or function declared in its body. */
++function localsOf(fn: any): Set<string> {
++    const out = new Set<string>();
++    for (const p of fn.params ?? []) namesIn(p, out);
++    const seen = new WeakSet<object>();
++    const walk = (n: any) => {
++        if (!n || typeof n !== 'object' || seen.has(n)) return;
++        seen.add(n);
++        if (n.type === 'VariableDeclarator') namesIn(n.id, out);
++        if ((n.type === 'FunctionDeclaration' || n.type === 'FunctionExpression' || n.type === 'ArrowFunctionExpression') && n !== fn) {
++            if (n.id) out.add('id:' + n.id.name);
++            for (const p of n.params ?? []) namesIn(p, out);
++        }
++        for (const key of Object.keys(n)) {
++            if (AST_SKIP_KEYS.has(key)) continue;
++            const v = n[key];
++            if (Array.isArray(v)) v.forEach(walk);
++            else if (v && typeof v === 'object') walk(v);
++        }
++    };
++    walk(fn.body);
++    // `$$` and friends are already left out; anything else declared here stays inside.
++    return out;
++}
++
++/**
++ * Keep only the statements the last one depends on. Returns the pruned list, or null when the slice is beyond the
++ * analysis (then it runs unpruned, as before).
++ */
++export function pruneSliceStmts(stmts: any[]): any[] | null {
++    if (stmts.length < 2) return null;
++    try {
++        // What each user function reads and writes, including the functions it calls.
++        const fns = new Map<string, Effects>();
++        for (const s of stmts) {
++            if (s.type === 'FunctionDeclaration' && s.id?.name) {
++                // Only what the function shares with the script: its parameters and its own temporaries are its own.
++                const fx = effectsOf(s.body);
++                const locals = localsOf(s);
++                for (const set of [fx.reads, fx.writes]) for (const n of [...set]) if (locals.has(n)) set.delete(n);
++                fns.set(s.id.name, fx);
++            }
++        }
++        for (let changed = true; changed; ) {
++            changed = false;
++            for (const fx of fns.values()) {
++                for (const callee of fx.calls) {
++                    const other = fns.get(callee);
++                    if (!other) throw new PruneUnsupported(`call to unknown function ${callee}`);
++                    const before = fx.reads.size + fx.writes.size + (fx.mutates ? 1 : 0);
++                    other.reads.forEach((r) => fx.reads.add(r));
++                    other.writes.forEach((w) => fx.writes.add(w));
++                    fx.mutates ||= other.mutates;
++                    if (fx.reads.size + fx.writes.size + (fx.mutates ? 1 : 0) !== before) changed = true;
++                }
++            }
++        }
++
++        const effects = (s: any): Effects => {
++            const fx = effectsOf(s);
++            for (const callee of fx.calls) {
++                const f = fns.get(callee);
++                if (!f) throw new PruneUnsupported(`call to unknown function ${callee}`);
++                f.reads.forEach((r) => fx.reads.add(r));
++                f.writes.forEach((w) => fx.writes.add(w));
++                // A function that changes things may change what it was given.
++                if (f.mutates) namesIn(s, fx.writes);
++            }
++            return fx;
++        };
++
++        const keep = new Array(stmts.length).fill(false);
++        keep[stmts.length - 1] = true;
++        const live = new Set(effects(stmts[stmts.length - 1]).reads);
++        for (let i = stmts.length - 2; i >= 0; i--) {
++            const s = stmts[i];
++            if (s.type === 'FunctionDeclaration') {
++                keep[i] = true;
++                continue;
++            }
++            const fx = effects(s);
++            if ([...fx.writes].some((w) => live.has(w))) {
++                keep[i] = true;
++                fx.reads.forEach((r) => live.add(r));
++            }
++        }
++        return stmts.filter((_, i) => keep[i]);
++    } catch (err) {
++        if (err instanceof PruneUnsupported) {
++            (globalThis as any).__pruneSkips?.push(err.message);
++            return null;
++        }
++        throw err;
++    }
++}
++
+ /** Wrap a sliced statement list back into an async arrow Function. */
+ function buildSliceFunction(wrapperFn: any, slicedStmts: any[]): Function {
+     const slicedAst = {
+@@ -359,10 +670,27 @@ export function buildLtfSlices(ast: any): Record<string, Function> {
+         } else {
+             // Phase 3 path: call lives inside a function body.
+             stmts = buildPhase3SliceStmts(wrapperFn.body, path);
++
++            // The function may be called from several top-level statements
++            // (e.g. one per timeframe). Each call runs under its own call-site
++            // id, so the runtime expression name is `<callsiteId>pN`, and the
++            // bare `pN` slice above stops at the EARLIEST invocation: a
++            // secondary for any later call site would never reach it. Add one
++            // slice per call site, ending at the statement that makes it.
++            const fnNode = path.find((n, i) => i > 0 && isFunctionLike(n));
++            const fnName = fnNode?.type === 'FunctionDeclaration' ? fnNode.id?.name : null;
++            if (fnName) {
++                for (const { callsiteId, stmtIdx } of findTopLevelInvocations(wrapperFn.body, fnName, fnNode)) {
++                    const key = callsiteId + exprName;
++                    if (key in slices) continue;
++                    const siteStmts = buildPhase3SliceStmts(wrapperFn.body, path, stmtIdx);
++                    if (siteStmts && siteStmts.length > 0) slices[key] = buildSliceFunction(wrapperFn, pruneSliceStmts(siteStmts) ?? siteStmts);
++                }
++            }
+         }
+         if (!stmts || stmts.length === 0) continue;
+ 
+-        const sliceFn = buildSliceFunction(wrapperFn, stmts);
++        const sliceFn = buildSliceFunction(wrapperFn, pruneSliceStmts(stmts) ?? stmts);
+         slices[exprName] = sliceFn;
+     }
+ 
+diff --git a/tests/namespaces/request-htf-slicing.test.ts b/tests/namespaces/request-htf-slicing.test.ts
+index 4a3f421..0aae27d 100644
+--- a/tests/namespaces/request-htf-slicing.test.ts
++++ b/tests/namespaces/request-htf-slicing.test.ts
+@@ -116,8 +116,9 @@ plot(ltf.size(), "ltfSz")
+         // first slice covers only request.security (not request.security_lower_tf yet).
+         expect(first).toMatch(/request\.security\(/);
+         expect(first).not.toMatch(/request\.security_lower_tf/);
+-        // second slice covers both calls (its prefix includes the first).
+-        expect(second).toMatch(/request\.security\(/);
++        // second slice covers only its own call: the first is in its prefix but
++        // nothing it computes reaches the second, so pruning drops it.
++        expect(second).not.toMatch(/request\.security\(/);
+         expect(second).toMatch(/request\.security_lower_tf/);
+     });
+ 
+diff --git a/tests/namespaces/request-lower-tf-slicing.test.ts b/tests/namespaces/request-lower-tf-slicing.test.ts
+index d146eaa..6bcb279 100644
+--- a/tests/namespaces/request-lower-tf-slicing.test.ts
++++ b/tests/namespaces/request-lower-tf-slicing.test.ts
+@@ -126,7 +126,7 @@ plot(postEma, "postEma")
+         expect(src).not.toMatch(/'postEma'/);
+     });
+ 
+-    it('Phase 3: param names are stored with their static `pN` form (despite runtime path-prefixing)', () => {
++    it('Phase 3: param names are stored with their static `pN` form, plus one `<callsiteId>pN` per call site', () => {
+         const code = `
+ //@version=5
+ indicator("phase3 key")
+@@ -138,10 +138,52 @@ plot(a)
+ `;
+         const fn = transpile(code) as any;
+         const keys = Object.keys(fn._ltfSlices ?? {});
+-        expect(keys.length).toBeGreaterThan(0);
+-        // Slice keys must be bare `pN` literals — the runtime
+-        // strips any path prefix before lookup.
+-        for (const k of keys) expect(/^p\d+$/.test(k)).toBe(true);
++        // The bare `pN` key (earliest invocation) and the call site's own
++        // key, matching the runtime's path-prefixed `$$.id + 'pN'` name.
++        expect(keys.filter((k) => /^p\d+$/.test(k)).length).toBe(1);
++        expect(keys.filter((k) => /^_fn\d+p\d+$/.test(k)).length).toBe(1);
++    });
++
++    it('Phase 3: a function called from several statements gets a slice per call site, each reaching its call', () => {
++        const code = `
++//@version=5
++indicator("phase3 multi")
++f(s, tf) =>
++    request.security(s, tf, close)
++a = f(syminfo.tickerid, "240")
++b = f(syminfo.tickerid, "120")
++postEma = ta.ema(close, 50)
++plot(a, "a")
++plot(b, "b")
++`;
++        const fn = transpile(code) as any;
++        const sites = Object.keys(fn._ltfSlices ?? {}).filter((k) => /^_fn\d+p\d+$/.test(k));
++        expect(sites.length).toBe(2);
++        const [first, second] = sites.map((k) => fn._ltfSlices[k].toString());
++        // The first site's slice stops at the first call; the second reaches the second.
++        expect(first).toMatch(/'240'/);
++        expect(first).not.toMatch(/'120'/);
++        expect(second).toMatch(/'120'/);
++        expect(second).not.toMatch(/glb1_postEma/);
++    });
++
++    it('Phase 3: request.security in a function called twice returns values for both calls', async () => {
++        const bars = Array.from({ length: 60 }, (_, i) => {
++            const t = Date.UTC(2024, 0, 1) + i * 3600e3;
++            return { openTime: t, closeTime: t + 3600e3, open: i, high: i, low: i, close: i, volume: 1 };
++        });
++        const pineTS = new PineTS(bars, 'BTCUSDT', '60');
++        const ctx = await pineTS.run(`
++//@version=5
++indicator("phase3 twice")
++f(s, tf) =>
++    request.security(s, tf, close)
++plot(f("BTCUSDT", "240"), "a")
++plot(f("BTCUSDT", "120"), "b")
++`);
++        const valued = (k: string) => ctx.plots[k].data.filter((p: any) => Number.isFinite(p.value)).length;
++        expect(valued('a')).toBeGreaterThan(0);
++        expect(valued('b')).toBeGreaterThan(0);
+     });
+ 
+     // ─────────────────────────────────────────────────────────────────────
+@@ -394,15 +436,14 @@ plot(b.size(), "b")
+         // the second one (`ta.rsi(close, 7)`).
+         expect(first).toMatch(/ta\.sma/);
+         expect(first).not.toMatch(/ta\.rsi/);
+-        // Second slice covers everything up to AND including the second
+-        // call — both ta.sma (still in the prefix) and ta.rsi.
+-        expect(second).toMatch(/ta\.sma/);
++        // Second slice ends at the second call. The first call and
++        // `midStmt` (between the two) are in its prefix, but neither feeds
++        // the second call, so pruning drops them.
++        expect(second).not.toMatch(/ta\.sma/);
+         expect(second).toMatch(/ta\.rsi/);
+         // Neither slice should contain the post-call `plot("a")` /
+         // `plot("b")` literals or the post-call work between them.
+-        // Note the `midStmt = ta.ema(close, 5)` lives BETWEEN the two
+-        // calls, so it must be IN the second slice but NOT in the first.
+         expect(first).not.toMatch(/glb1_midStmt/);
+-        expect(second).toMatch(/glb1_midStmt/);
++        expect(second).not.toMatch(/glb1_midStmt/);
+     });
+ });
+diff --git a/tests/namespaces/request-security-inputs-cache.test.ts b/tests/namespaces/request-security-inputs-cache.test.ts
+new file mode 100644
+index 0000000..83a102f
+--- /dev/null
++++ b/tests/namespaces/request-security-inputs-cache.test.ts
+@@ -0,0 +1,150 @@
++// SPDX-License-Identifier: AGPL-3.0-only
++
++/**
++ * request.security and inputs:
++ *
++ *   - An input override reaches the secondary (the requested timeframe sees the
++ *     same settings as the chart).
++ *   - A slice keeps only the statements its call depends on.
++ *   - With a securityCache, a secondary's result is reused across runs while the
++ *     inputs it depends on keep their values.
++ *
++ * References are independent of the code under test: a script whose default IS
++ * the overridden value, and the same request made without a helper function.
++ */
++
++import { describe, it, expect } from 'vitest';
++import { PineTS, Provider, Indicator } from 'index';
++import { transpile } from '../../src/transpiler/index';
++
++const chartStart = new Date('2018-12-15').getTime();
++const chartEnd = new Date('2019-03-15').getTime();
++const makePineTS = () => new PineTS(Provider.Mock, 'BTCUSDC', 'D', null, chartStart, chartEnd);
++// The mock data has 1h, 4h and 1d bars from 2024.
++const makeHourly = () =>
++    new PineTS(Provider.Mock, 'BTCUSDC', '60', null, new Date('2024-03-01').getTime(), new Date('2024-03-20').getTime());
++
++const values = (ctx: any, title: string) => ctx.plots[title].data.map((p: any) => p.value);
++
++const withLen = (len: number) => `
++//@version=5
++indicator("inputs reach security")
++len = input.int(${len}, "Len")
++f(tf) => request.security(syminfo.tickerid, tf, ta.sma(close, len))
++plot(request.security(syminfo.tickerid, "W", ta.sma(close, len)), "Direct")
++plot(f("W"), "InFn")
++`;
++
++describe('request.security with inputs', () => {
++    it('an input override reaches the requested timeframe', async () => {
++        const overridden = await makePineTS().run(new Indicator(withLen(3), { Len: 6 }));
++        const reference = await makePineTS().run(withLen(6));
++        const defaults = await makePineTS().run(withLen(3));
++
++        expect(values(overridden, 'Direct')).toEqual(values(reference, 'Direct'));
++        expect(values(overridden, 'InFn')).toEqual(values(reference, 'InFn'));
++        // And the override changed something, so the comparison means something.
++        expect(values(overridden, 'Direct')).not.toEqual(values(defaults, 'Direct'));
++    });
++
++    it("a call site's slice keeps only the statements its call depends on", () => {
++        const code = `
++//@version=5
++indicator("pruned slices")
++len = input.int(4, "Len")
++style = input.string("a", "Style")
++f(tf) => request.security(syminfo.tickerid, tf, ta.sma(close, len))
++a = f("W")
++unrelated = ta.ema(close, 9) + (style == "a" ? 1 : 2)
++b = f("M")
++plot(a, "A")
++plot(b, "B")
++`;
++        const fn = transpile(code) as any;
++        const sites = Object.keys(fn._ltfSlices).filter((k) => /^_fn\d+p\d+$/.test(k));
++        expect(sites.length).toBe(2);
++        const [first, second] = sites.map((k) => fn._ltfSlices[k].toString());
++        // The second call site's slice needs len, not the first call, the EMA or the Style input.
++        expect(second).toMatch(/glb1_len/);
++        expect(second).not.toMatch(/glb1_a\b/);
++        expect(second).not.toMatch(/glb1_unrelated/);
++        expect(second).not.toMatch(/glb1_style/);
++        expect(first).not.toMatch(/glb1_style/);
++    });
++
++    it('pruned slices give the same values as the same requests made directly', async () => {
++        const viaFn = await makePineTS().run(`
++//@version=5
++indicator("via fn")
++len = input.int(4, "Len")
++f(tf) => request.security(syminfo.tickerid, tf, ta.sma(close, len))
++a = f("W")
++noise = ta.ema(close, 9)
++b = f("M")
++plot(a, "A")
++plot(b, "B")
++`);
++        const direct = await makePineTS().run(`
++//@version=5
++indicator("direct")
++len = input.int(4, "Len")
++plot(request.security(syminfo.tickerid, "W", ta.sma(close, len)), "A")
++plot(request.security(syminfo.tickerid, "M", ta.sma(close, len)), "B")
++`);
++        expect(values(viaFn, 'A')).toEqual(values(direct, 'A'));
++        expect(values(viaFn, 'B')).toEqual(values(direct, 'B'));
++    });
++
++    it('a securityCache reuses a secondary while the inputs it depends on are unchanged', async () => {
++        const code = `
++//@version=5
++indicator("cached")
++len = input.int(4, "Len")
++style = input.string("a", "Style")
++f(tf) => request.security(syminfo.tickerid, tf, ta.sma(close, len))
++shown = style == "a" ? 1 : 2
++plot(f("240"), "H4")
++plot(f("D"), "D")
++plot(shown, "Shown")
++`;
++        const entries = new Map<string, any[]>();
++        let stored = 0;
++        const store = {
++            get: async (parts: any) => entries.get(JSON.stringify(parts)),
++            set: async (parts: any, entry: any) => {
++                stored++;
++                const key = JSON.stringify(parts);
++                entries.set(key, [entry, ...(entries.get(key) ?? [])]);
++            },
++        };
++        const run = async (inputs: Record<string, unknown>) => {
++            const pine = makeHourly();
++            pine.securityCache = store;
++            return pine.run(new Indicator(code, inputs));
++        };
++
++        const first = await run({});
++        expect(stored).toBe(2);
++
++        // Style feeds neither request: both are reused, and the result is what a fresh run gives.
++        const styled = await run({ Style: 'b' });
++        expect(stored).toBe(2);
++        const freshStyled = await makeHourly().run(new Indicator(code, { Style: 'b' }));
++        expect(values(styled, 'H4')).toEqual(values(freshStyled, 'H4'));
++        expect(values(styled, 'D')).toEqual(values(freshStyled, 'D'));
++        expect(values(styled, 'Shown')).toEqual(values(freshStyled, 'Shown'));
++        expect(values(styled, 'H4')).toEqual(values(first, 'H4'));
++
++        // Len feeds both: both run again, with the new length.
++        const longer = await run({ Len: 7 });
++        expect(stored).toBe(4);
++        const freshLonger = await makeHourly().run(new Indicator(code, { Len: 7 }));
++        expect(values(longer, 'H4')).toEqual(values(freshLonger, 'H4'));
++        expect(values(longer, 'D')).toEqual(values(freshLonger, 'D'));
++        expect(values(longer, 'H4')).not.toEqual(values(first, 'H4'));
++
++        // Back to the first settings: reused again.
++        await run({ Style: 'a', Len: 4 });
++        expect(stored).toBe(4);
++    });
++});

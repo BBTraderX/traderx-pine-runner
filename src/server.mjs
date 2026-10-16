@@ -52,6 +52,8 @@ export function runInWorker(payload, { timeoutMs = RUN_TIMEOUT_MS, heapMb = HEAP
       timeoutMs,
     );
     worker.on('message', (msg) => {
+      if (msg?.type === 'security-get') return worker.postMessage({ id: msg.id, entries: securityResults.get(msg.parts) });
+      if (msg?.type === 'security-set') return securityResults.set(msg.parts, msg.entry);
       if (msg?.type !== 'candles') return done(msg);
       // request.security wants another timeframe or symbol: load it here, through the shared cache.
       fetchCandleRange(msg.coin, msg.interval, msg.startTime, msg.endTime).then(
@@ -85,6 +87,53 @@ async function readJson(req) {
     throw Object.assign(new Error('Body must be JSON.'), { status: 400 });
   }
 }
+
+/**
+ * Other timeframes' results (request.security), by script, symbol, timeframe, call and date range, each with the
+ * settings it depends on. A run whose settings differ only where a timeframe doesn't look reuses it, so changing a
+ * display setting doesn't recompute a dozen timeframes. Bounded by an estimate of the memory the values take.
+ */
+export const securityResults = (() => {
+  const MAX_BYTES = 150 * 1024 * 1024;
+  const TTL_MS = 5 * 60_000;
+  const PER_KEY = 4;
+  const byKey = new Map();
+  let bytes = 0;
+  const keyOf = (parts) => createHash('sha256').update(JSON.stringify(parts)).digest('hex');
+  const sizeOf = (entry) => {
+    const first = entry.values?.find?.((v) => v != null);
+    const width = Array.isArray(first) ? first.length : 1;
+    return (entry.values?.length ?? 0) * (width * 16 + 16) + (entry.openTime?.length ?? 0) * 32 + 1024;
+  };
+  const drop = (key) => {
+    for (const e of byKey.get(key) ?? []) bytes -= e.size;
+    byKey.delete(key);
+  };
+  return {
+    get(parts) {
+      const key = keyOf(parts);
+      const list = (byKey.get(key) ?? []).filter((e) => Date.now() - e.at < TTL_MS);
+      if (!list.length) {
+        drop(key);
+        return undefined;
+      }
+      byKey.delete(key);
+      byKey.set(key, list);
+      return list.map((e) => e.entry);
+    },
+    set(parts, entry) {
+      const key = keyOf(parts);
+      const size = sizeOf(entry);
+      if (size > MAX_BYTES / 4) return;
+      const list = [{ entry, size, at: Date.now() }, ...(byKey.get(key) ?? [])];
+      drop(key);
+      const kept = list.slice(0, PER_KEY);
+      for (const e of kept) bytes += e.size;
+      byKey.set(key, kept);
+      while (bytes > MAX_BYTES && byKey.size > 1) drop(byKey.keys().next().value);
+    },
+  };
+})();
 
 /** Recent runs by script, settings and candles. Small: a result holds every plot's values for every bar. */
 const results = new Map();
