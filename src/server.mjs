@@ -89,19 +89,20 @@ async function readJson(req) {
 /** Recent runs by script, settings and candles. Small: a result holds every plot's values for every bar. */
 const results = new Map();
 const MAX_RESULTS = 20;
+const RESULT_MS = 5 * 60_000;
 
 /** Null when the run's candles came with the request: those aren't worth keying on. */
 function resultKey(source, coin, interval, inputs, series) {
   if (typeof coin !== 'string' || !series.length) return null;
-  const last = series.at(-1);
-  // A new or updated last bar is a new key, so a remembered run never outlives the candles it ran on.
-  const candles = [series.length, series[0].openTime, last.openTime, last.close, last.volume];
+  // The bars, not the live bar's price: that moves every few seconds, which would miss every time for a script that
+  // runs for most of a minute. A new bar is a new key, and a remembered run lasts at most RESULT_MS.
+  const candles = [series.length, series[0].openTime, series.at(-1).openTime];
   return createHash('sha256').update(JSON.stringify([source, coin.trim(), interval, inputs ?? {}, candles])).digest('hex');
 }
 
 function remember(key, entry) {
   results.delete(key);
-  results.set(key, entry);
+  results.set(key, { ...entry, at: Date.now() });
   if (results.size > MAX_RESULTS) results.delete(results.keys().next().value);
 }
 
@@ -137,7 +138,8 @@ export async function handleRun(body, { search = false, signal } = {}) {
   // the script, so answer from that run. A heavy multi-timeframe script takes most of a minute on the host; a rule
   // change shouldn't.
   const key = search ? null : resultKey(source, coin, interval, inputs, series);
-  const prior = key && results.get(key);
+  const remembered = key && results.get(key);
+  const prior = remembered && Date.now() - remembered.at < RESULT_MS ? remembered : null;
   if (prior) {
     try {
       validateConditions(conditions ?? null);
